@@ -50,6 +50,8 @@ def print_board_heatmaps_for_move(
         print(f"Нет состояний с turn == {move_index}")
         return
 
+
+
     black_boards = []
     white_boards = []
 
