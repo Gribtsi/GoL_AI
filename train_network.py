@@ -1,11 +1,72 @@
-import torch
+
 import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader
 
 from board import BOARD_SIZE
-from game import board_size_sqr
 
+import h5py
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+
+class TrainingDataset(Dataset):
+    def __init__(self, h5_file_path, board_size=19):
+        super().__init__()
+        self.h5_file_path = h5_file_path
+        self.board_size = board_size
+        self.board_size_sqr = board_size * board_size
+
+        # Мы не открываем файл здесь, чтобы избежать конфликтов при multiprocessing
+        self.file = None
+
+        # Сканируем файл, чтобы узнать общее количество позиций и где они лежат
+        self.index_map = []
+        with h5py.File(self.h5_file_path, 'r') as f:
+            for game_id in f.keys():
+                game_group = f[game_id]
+                num_turns = len(game_group['value'])
+                # Сохраняем "координаты" каждого хода: (game_id, индекс_внутри_игры)
+                for i in range(num_turns):
+                    self.index_map.append((game_id, i))
+
+        self.total_samples = len(self.index_map)
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        # Ленивое открытие файла (каждый воркер DataLoader'а откроет свой)
+        if self.file is None:
+            # swmr=True позволяет читать файл, пока в него пишет другой процесс (воркер-генератор)
+            self.file = h5py.File(self.h5_file_path, 'r', swmr=True)
+
+        game_id, turn_idx = self.index_map[idx]
+        group = self.file[game_id]
+
+        # Читаем данные конкретного хода (numpy arrays)
+        state = group['state_tensor'][turn_idx]
+        policy = group['mcts_policy'][turn_idx]
+        territory = group['territories'][turn_idx]
+        value = group['value'][turn_idx]
+        score = group['score'][turn_idx]
+
+        # Применяем аугментацию (ваша существующая функция)
+        aug_state, aug_policy, aug_territory = augment_data(
+            state, policy, territory
+        )
+
+        # Подготавливаем скаляры
+        # Сдвигаем score чтобы он был >= 0 для кросс-энтропии, как у вас в коде
+        score = score + self.board_size_sqr
+
+        # Возвращаем тензоры
+        return (
+            torch.from_numpy(aug_state).float(),
+            torch.from_numpy(aug_policy).float(),
+            torch.tensor([value], dtype=torch.float32),  # unsqueeze(1) эквивалент
+            torch.from_numpy(aug_territory).float().unsqueeze(0),  # (1, H, W)
+            torch.tensor(score, dtype=torch.long)
+        )
 
 def augment_data(state: np.ndarray, policy: np.ndarray, territory: np.ndarray):
     """
@@ -61,63 +122,26 @@ def augment_data(state: np.ndarray, policy: np.ndarray, territory: np.ndarray):
 
 
 def train_network_epochs(
-        model,
-        optimizer,
-        training_data,
-        epochs=1,
-        batch_size=256,
-        device="cpu",
-        w_terr=0.03,
-        w_score=0.02
+        model, optimizer, h5_file_path,  # Теперь передаем путь к HDF5
+        epochs=1, batch_size=256, device="cpu",
+        w_terr=0.03, w_score=0.02
 ):
-    """
-    Обучает нейросеть на данных, собранных в ходе self-play.
-    К данным предварительно применяется аугментация (вращения/отражения).
-    """
     model.train()
     model.to(device)
 
-    # --- Подготовка и аугментация данных ---
-    aug_states = []
-    aug_policies = []
-    aug_territories = []
+    # Инициализируем наш новый Dataset
+    dataset = TrainingDataset(h5_file_path)
 
-    # Value и Score не зависят от пространственной ориентации доски
-    values = []
-    scores = []
+    # num_workers=4 (или больше) значительно ускорит загрузку с диска
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
 
-    try:
-        for d in training_data:
-            # Применяем аугментацию к пространственным данным
-            state, policy, territory = augment_data(
-                d['state_tensor'],
-                d['mcts_policy'],
-                d['territories']
-            )
-
-            aug_states.append(state)
-            aug_policies.append(policy)
-            aug_territories.append(territory)
-
-            # Непространственные данные просто копируем
-            values.append(d['value'])
-            scores.append(d['score']+ board_size_sqr)
-
-        # Конвертация в тензоры
-        states_t = torch.tensor(np.array(aug_states), dtype=torch.float32)
-        policies_t = torch.tensor(np.array(aug_policies), dtype=torch.float32)
-        values_t = torch.tensor(np.array(values), dtype=torch.float32).unsqueeze(1)
-        territories_t = torch.tensor(np.array(aug_territories), dtype=torch.float32).unsqueeze(1)
-        scores_t = torch.tensor(np.array(scores), dtype=torch.long)
-
-    except Exception as e:
-        print(f"Ошибка при подготовке и конвертации данных в тензоры: {e}")
-        return
-
-    dataset = TensorDataset(states_t, policies_t, values_t, territories_t, scores_t)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-
-    print(f"Начинаем обучение на {len(dataset)} примерах (с аугментацией)...")
+    print(f"Начинаем обучение на {len(dataset)} примерах из HDF5...")
 
     for epoch in range(epochs):
         total_policy_loss = 0
@@ -163,61 +187,25 @@ def train_network_epochs(
               f"Pol = {avg_policy_loss:.4f}, Val = {avg_value_loss:.4f}, "
               f"Terr = {avg_terr_loss:.4f}, Score = {avg_score_loss:.4f}")
 
-
 def train_network_steps(
-        model,
-        optimizer,
-        training_data,
-        steps=50,
-        batch_size=256,
-        device="cpu",
-        entropy_beta=0.01,
-        w_terr=0.03,
-        w_score=0.02
+        model, optimizer, h5_file_path, # Передаем путь
+        steps=50, batch_size=256, device="cpu",
+        entropy_beta=0.01, w_terr=0.03, w_score=0.02
 ):
-    """
-    Обучает нейросеть на данных из буфера случайными батчами.
-    К данным предварительно применяется аугментация (вращения/отражения).
-    """
     model.train()
     model.to(device)
 
-    # --- Подготовка и аугментация данных ---
-    aug_states = []
-    aug_policies = []
-    aug_territories = []
-    values = []
-    scores = []
+    dataset = TrainingDataset(h5_file_path)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=4,
+        pin_memory=True
+    )
 
-    try:
-        for d in training_data:
-            state, policy, territory = augment_data(
-                d['state_tensor'],
-                d['mcts_policy'],
-                d['territories']
-            )
-
-            aug_states.append(state)
-            aug_policies.append(policy)
-            aug_territories.append(territory)
-
-            values.append(d['value'])
-            scores.append(d['score'] + board_size_sqr)
-
-        states_t = torch.from_numpy(np.array(aug_states)).float()
-        policies_t = torch.from_numpy(np.array(aug_policies)).float()
-        values_t = torch.from_numpy(np.array(values)).float().unsqueeze(1)
-        territories_t = torch.from_numpy(np.array(aug_territories)).float().unsqueeze(1)
-        scores_t = torch.from_numpy(np.array(scores)).long()
-
-    except Exception as e:
-        print(f"Ошибка при подготовке и конвертации данных в тензоры: {e}")
-        return
-
-    dataset = TensorDataset(states_t, policies_t, values_t, territories_t, scores_t)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-
-    print(f"Начинаем обучение. Буфер: {len(dataset)} позиций, Шагов: {steps} (с аугментацией)...")
+    print(f"Начинаем обучение. Позиций на диске: {len(dataset)}, Шагов: {steps}...")
 
     total_policy_loss, total_value_loss = 0.0, 0.0
     total_terr_loss, total_score_loss = 0.0, 0.0

@@ -1,13 +1,7 @@
+from typing import Tuple, Optional, Dict, Any
 import numpy as np
-from collections import deque
-import json
-from typing import Tuple, Optional, List, Set, Dict, Any
-from copy import deepcopy
-
-from matplotlib.style.core import available
-from numba import njit
-from scipy.linalg import hilbert
-
+from fontTools.svgLib.path.parser import BOOL_RE
+from numba import njit, prange
 
 class Move:
     """Класс для представления хода в игре Go + Game of Life."""
@@ -61,342 +55,199 @@ class Move:
         )
 
 
-import numpy as np
-from numba import njit
-from typing import Tuple, Optional
-
 # --- Константы и вспомогательные функции, также помеченные @njit ---
 
-BOARD_SIZE = 11
+BOARD_SIZE = 7
+board_size_sqr = BOARD_SIZE * BOARD_SIZE
+possible_moves_total = BOARD_SIZE * BOARD_SIZE * 2 + 1
+
+MAX_KOMI = 15
+
 EMPTY = 0
 BLACK = 1
 WHITE = 2
 
+NN_HISTORY = 100
+MAX_HISTORY = 1000
+
+STATES_TO_NN = 32
+IN_CHANNELS = STATES_TO_NN + 1
+
+"""
+Легенда:
+- ⬜ = пустая ячейка
+- ⚫ = черный камень
+- 🔴 = белый камень
+- ❎ = можно поставить камень, но не провести цикл жизни
+- 🟩 = можно установить камень и затем провести цикл жизни
+"""
+symbols = {
+    BLACK: '⚫',
+    WHITE: '🔴',
+    EMPTY + 10 : '❎',
+    EMPTY + 100 : '🟩',
+    EMPTY : '⬜',
+}
 
 @njit
 def is_valid_position(x: int, y: int) -> bool:
     """Проверяет, находится ли позиция в пределах доски."""
     return 0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE
 
-@njit
-def is_valid_move_numba(
-        current_state: np.ndarray,
-        history_stack: np.ndarray,  # История как (N, 19, 19) numpy-массив
-        current_player: int,
-        x: int, y: int,
-        life_cycles: int
-) -> bool:
-    # --- Быстрые проверки ---
-    # Ход за пределы доски
-    if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
-        return False
-    # Ход в занятую клетку
-    if current_state[x, y] != EMPTY:
-        return False
-
-    # --- Симуляция хода (эквивалент make_move(commit=False)) ---
-
-    # ШАГ 1: Установка камня и проверка захватов
-    future_state_1 = current_state.copy()
-    future_state_1[x, y] = current_player
-
-    # Проверяем и снимаем камни оппонента
-    marked_opponent = check_captures(future_state_1)
-    remove_captured_stones(future_state_1, marked_opponent, exclude_color=current_player)
-
-    # Проверка на самоубийственный ход
-    _, liberties = find_group_and_liberties(x, y, future_state_1)
-    if liberties == 0:
-        return False
-
-    # Проверка правила "ко"
-    for i in range(history_stack.shape[0]):
-        if np.array_equal(future_state_1, history_stack[i]):
-            return False
-
-    # --- ШАГ 2: Симуляция цикла жизни (если нужно) ---
-    final_state = future_state_1
-    if life_cycles == 1:
-        future_state_2 = apply_game_of_life(future_state_1, current_player)
-
-        # Снимаем камни оппонента после цикла жизни
-        marked_after_life_opp = check_captures(future_state_2)
-        remove_captured_stones(future_state_2, marked_after_life_opp, exclude_color=current_player)
-
-        # Проверяем и снимаем любые "самоубийственные" группы после цикла жизни
-        marked_after_life_any = check_captures(future_state_2)
-        remove_captured_stones(future_state_2, marked_after_life_any, exclude_color=-1)  # -1 значит никого не исключать
-
-        # Финальная проверка "ко"
-        for i in range(history_stack.shape[0]):
-            if np.array_equal(future_state_2, history_stack[i]):
-                return False
-
-        final_state = future_state_2
-
-    # Если все проверки пройдены, ход легален
-    return True
-
-
-@njit(fastmath=True, cache=True)
-def check_superko_numba(current_state: np.ndarray, history_stack: np.ndarray) -> bool:
-    """
-    Проверяет правило ситуационного Суперко.
-
-    Args:
-        current_state: Текущее состояние доски (H, W)
-        history_stack: Стек истории состояний (N, H, W)
-
-    Returns:
-        True если ход легален (нет повторения), False если нарушает правило.
-    """
-    n_history = history_stack.shape[0]
-
-    # Если история пуста или слишком коротка, проверять нечего
-    if n_history == 0:
-        return True
-
-    rows = current_state.shape[0]
-    cols = current_state.shape[1]
-
-    # Итерируемся с конца стека:
-    # range(start, stop, step)
-    # start = n_history - 2 (предпоследний элемент)
-    # stop = -1 (до 0 включительно)
-    # step = -2 (ситуационное суперко: проверяем только ходы текущего игрока)
-    for i in range(n_history - 4, -1, -4):
-
-        # Ручной цикл сравнения массивов быстрее np.array_equal в Numba,
-        # так как позволяет сделать break при первом же несовпадении
-        is_equal = True
-        for r in range(rows):
-            for c in range(cols):
-                if history_stack[i, r, c] != current_state[r, c]:
-                    is_equal = False
-                    break  # Прерываем внутренний цикл (по столбцам)
-            if not is_equal:
-                break  # Прерываем внешний цикл (по строкам) - переходим к следующему состоянию в истории
-
-        # Если после проверки is_equal осталось True, значит мы нашли полное совпадение
-        if is_equal:
-            return False
-
-    return True
-
-
-@njit(fastmath=True, cache=True)
-def check_megako_numba(current_state: np.ndarray,
-                       history_stack: np.ndarray,
-                       player_color: int) -> bool:
-    """
-    Проверяет правило "Мега-Ко":
-    Запрещено повторять конфигурацию СВОИХ камней, которая уже встречалась
-    в прошлом (на своих ходах).
-
-    Args:
-        current_state: (H, W) массив
-        history_stack: (N, H, W) массив
-        player_color: целое число, обозначающее камни текущего игрока (например, 1)
-
-    Returns:
-        True если ход легален, False если конфигурация камней игрока повторяется.
-    """
-    n_history = history_stack.shape[0]
-    if n_history == 0:
-        return True
-
-    rows = current_state.shape[0]
-    cols = current_state.shape[1]
-
-    # Проходим по истории с шагом 2 (только свои предыдущие ходы)
-    # range(start, stop, step) -> от предпоследнего до 0
-    for i in range(n_history - 2, -1, -4):
-
-        # Предполагаем, что конфигурация камней совпадает (Illegal)
-        stones_match = True
-
-        # Сканируем доску
-        for r in range(rows):
-            for c in range(cols):
-                # Нас волнует ТОЛЬКО совпадение наличия камня игрока.
-                # Есть ли камень игрока сейчас?
-                curr_is_player = (current_state[r, c] == player_color)
-                # Был ли камень игрока тогда?
-                hist_is_player = (history_stack[i, r, c] == player_color) or (history_stack[i + 1, r, c] == player_color)
-
-                # Если в одной позиции есть камень, а в другой нет (или наоборот)
-                # -> конфигурация НЕ совпадает, можно переходить к следующему снимку истории.
-                if curr_is_player != hist_is_player:
-                    stones_match = False
-                    break  # Break inner loop (cols)
-
-            if not stones_match:
-                break  # Break outer loop (rows)
-
-        # Если после полного прохода по доске мы не нашли отличий в расположении
-        # камней игрока -> это повтор.
-        if stones_match:
-            return False
-
-    return True
-
-@njit
-def position_permissions_numba(
-        current_state: np.ndarray,
-        history_stack: np.ndarray,  # История как (N, 19, 19) numpy-массив
-        current_player: int,
-        x: int, y: int
-) -> Tuple[bool, bool]:
-    # --- Быстрые проверки ---
-    # Ход за пределы доски
-    if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
-        return (False, False)
-    # Ход в занятую клетку
-    if current_state[x, y] != EMPTY:
-        return (False, False)
-
-    # --- Симуляция хода (эквивалент make_move(commit=False)) ---
-
-    # ШАГ 1: Установка камня и проверка захватов
-    future_state_1 = current_state.copy()
-    future_state_1[x, y] = current_player
-
-    should_check_captures = False
-    for nx, ny in get_neighbors_4(x, y):
-        if current_state[nx,ny] != EMPTY and current_state[nx,ny] != current_player:
-            should_check_captures = True
-            break
-
-    # Проверяем и снимаем камни оппонента
-    if should_check_captures:
-        marked_opponent = check_captures(future_state_1)
-        remove_captured_stones(future_state_1, marked_opponent, exclude_color=current_player)
-
-    # Проверка на самоубийственный ход
-    _, liberties = find_group_and_liberties(x, y, future_state_1)
-    if liberties == 0:
-        return (False, False)
-
-    # Проверка правила "ко"
-
-    if not check_megako_numba(future_state_1, history_stack, current_player):
-        return (False, False)
-
-    # --- ШАГ 2: Симуляция цикла жизни (если нужно) ---
-
-    future_state_2 = apply_game_of_life(future_state_1, current_player)
-
-    # Снимаем камни оппонента после цикла жизни
-    marked_after_life_opp = check_captures(future_state_2)
-    remove_captured_stones(future_state_2, marked_after_life_opp, exclude_color=current_player)
-
-    # Проверяем и снимаем любые "самоубийственные" группы после цикла жизни
-    marked_after_life_any = check_captures(future_state_2)
-    remove_captured_stones(future_state_2, marked_after_life_any, exclude_color=-1)  # -1 значит никого не исключать
-
-    # Финальная проверка "ко"
-    if not check_megako_numba(future_state_2, history_stack, current_player):
-        return (True, False)
-
-    # Если все проверки пройдены, ход легален
-    return (True, True)
-
-
-
-@njit
-def get_neighbors_4(x: int, y: int):
-    """Получает 4 соседа (вверх, вниз, влево, вправо)."""
-    neighbors = []
-    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        nx, ny = x + dx, y + dy
-        if is_valid_position(nx, ny):
-            neighbors.append((nx, ny))
-    return neighbors
-
-
 # --- Основные оптимизированные функции ---
 
 @njit
-def find_group_and_liberties(x: int, y: int, state: np.ndarray) -> Tuple[np.ndarray, int]:
+def find_group_and_liberties(x: int, y: int, state: np.ndarray, group_array: np.ndarray, visited: np.ndarray) -> Tuple[int, int]:
     """
-    Находит группу камней и подсчитывает её дыхания (liberties).
-    Реализовано с использованием numpy-массивов вместо deque и set для совместимости с Numba.
+    Находит группу камней, подсчитывает её размер и количество дыханий (liberties).
+    Зачищает group_array,
+    НЕ ЗАЧИЩАЕТ visited!!!
+    Returns:
+        group_array: np.ndarray размера (BOARD_SIZE * BOARD_SIZE, 2) с координатами.
+        group_size: int, реальное количество камней в группе.
+        liberties_count: int, количество уникальных степеней свободы.
     """
+
+
+    # Создаем массив фиксированного размера под группу.
+    # Используем np.empty для скорости (остальной мусор отсечется параметром group_size)
+
+    #group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
+
     color = state[x, y]
     if color == EMPTY:
-        # Возвращаем пустой массив координат
-        return np.empty((0, 2), dtype=np.int32), 0
+        return 0, 0
 
-    # Ручная реализация очереди на numpy-массивах
-    q = np.empty((BOARD_SIZE * BOARD_SIZE, 2), dtype=np.int16)
-    q_head, q_tail = 0, 0
+    group_array.fill(0)
 
-    q[q_tail] = np.array([x, y], dtype=np.int16)
-    q_tail += 1
+    visited[x, y] = True
 
-    visited_local = np.zeros_like(state, dtype=np.bool_)
-    visited_local[x, y] = True
+    # Первая точка группы
+    group_array[0, 0] = x
+    group_array[0, 1] = y
 
-    group_members = []
-    liberties = set()
+    head = 0
+    tail = 1  # tail в итоге будет равен размеру группы
+    liberties_count = 0
 
-    while q_head < q_tail:
-        cx, cy = q[q_head]
-        q_head += 1
+    # Векторы смещений для 4 соседей (встроено для максимальной скорости)
+    dx = np.array([-1, 1, 0, 0], dtype=np.int32)
+    dy = np.array([0, 0, -1, 1], dtype=np.int32)
 
-        group_members.append((cx, cy))
+    while head < tail:
+        cx = group_array[head, 0]
+        cy = group_array[head, 1]
+        head += 1
 
-        # Проверяем соседей
-        for nx, ny in get_neighbors_4(cx, cy):
-            if not visited_local[nx, ny]:
-                visited_local[nx, ny] = True
-                if state[nx, ny] == EMPTY:
-                    liberties.add((nx, ny))
-                elif state[nx, ny] == color:
-                    q[q_tail] = np.array([nx, ny], dtype=np.int16)
-                    q_tail += 1
+        for i in range(4):
+            nx = cx + dx[i]
+            ny = cy + dy[i]
 
-    # Конвертируем список группы в numpy-массив
-    group_array = np.empty((len(group_members), 2), dtype=np.int32)
-    for i, (gx, gy) in enumerate(group_members):
-        group_array[i, 0] = gx
-        group_array[i, 1] = gy
+            # Проверка границ доски
+            if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+                if not visited[nx, ny]:
+                    neighbor_color = state[nx, ny]
 
-    return group_array, len(liberties)
+                    if neighbor_color == EMPTY:
+                        # Нашли уникальное дыхание (свободную клетку)
+                        visited[nx, ny] = True
+                        liberties_count += 1
 
+                    elif neighbor_color == color:
+                        # Нашли камень той же группы
+                        visited[nx, ny] = True
+                        group_array[tail, 0] = nx
+                        group_array[tail, 1] = ny
+                        tail += 1
+
+    # В group_array первые `tail` элементов — это координаты нашей группы
+    # tail — это group_size
+    return tail, liberties_count
 
 @njit
-def check_captures(state: np.ndarray) -> np.ndarray:
+def check_captures_local(x: int, y: int, state: np.ndarray, marked_for_death : np.ndarray, visited: np.ndarray, group_array: np.ndarray) -> bool:
     """
-    Проверяет и отмечает группы камней без дыханий для захвата.
+    Быстрая проверка захватов только вокруг сыгранного камня (x, y).
+    Сначала проверяет группы противника на захват.
+    Затем проверяет саму группу сыгранного камня (на случай суицидального хода).
+
+    Args:
+        x: x позиция только что поставленного камня.
+        y: y позиция только что поставленного камня.
+        state: Текущее состояние доски (после постановки камня).
+
+    Returns:
+        np.ndarray: Матрица такого же размера, где ненулевые элементы
+                    показывают цвет захваченных камней.
     """
-    visited = np.zeros_like(state, dtype=np.bool_)
-    marked_for_death = np.zeros_like(state, dtype=np.int8)
+
+    played_color = state[x, y]
+    if played_color == EMPTY:
+        return False
+
+    marked_for_death.fill(0)
+    visited.fill(0)
+
+    # Векторы смещений для 4 соседей
+    dx = np.array([-1, 1, 0, 0], dtype=np.int32)
+    dy = np.array([0, 0, -1, 1], dtype=np.int32)
+
+    has_captures = False
+    # 1. Сначала проверяем 4 соседей (камни противника)
+    for i in range(4):
+        nx = x + dx[i]
+        ny = y + dy[i]
+
+        if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+            neighbor_color = state[nx, ny]
+            # Проверяем только камни противника, которые мы еще не проверяли
+            if neighbor_color != EMPTY and neighbor_color != played_color and not visited[nx, ny]:
+
+                size, liberties = find_group_and_liberties(nx, ny, state, group_array, visited)
+
+                # Помечаем всю группу противника как проверенную
+                for j in range(size):
+                    gx, gy = group_array[j, 0], group_array[j, 1]
+                    visited[gx, gy] = True
+
+                # Если у группы противника не осталось дыханий - она захвачена
+                if liberties == 0:
+                    for j in range(size):
+                        gx, gy = group_array[j, 0], group_array[j, 1]
+                        marked_for_death[gx, gy] = neighbor_color
+                        has_captures = True
+
+    return has_captures
+
+@njit
+def check_captures(state: np.ndarray, visited: np.ndarray, marked_for_death: np.ndarray, group_array: np.ndarray) -> None:
+    """
+    Проверяет всю доску и отмечает группы камней без дыханий для захвата.
+    Исправлено: цикл идет только по реальному размеру группы (size).
+    """
+
+    visited.fill(0)
+    marked_for_death.fill(0)
 
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
             if visited[x, y] or state[x, y] == EMPTY:
                 continue
 
-            group, liberties = find_group_and_liberties(x, y, state)
-
-            # Отмечаем группу как проверенную
-            for i in range(group.shape[0]):
-                gx, gy = group[i]
-                visited[gx, gy] = True
+            size, liberties = find_group_and_liberties(x, y, state, group_array, visited)
 
             # Если дыханий нет - отмечаем к смерти
             if liberties == 0:
-                stone_color = state[group[0, 0], group[0, 1]]
-                for i in range(group.shape[0]):
-                    gx, gy = group[i]
+                stone_color = state[group_array[0, 0], group_array[0, 1]]
+                for i in range(size):
+                    gx = group_array[i, 0]
+                    gy = group_array[i, 1]
                     marked_for_death[gx, gy] = stone_color
 
-    return marked_for_death
-
+    return
 
 @njit
-def remove_captured_stones(state: np.ndarray, marked: np.ndarray, exclude_color: int = -1):
+def remove_captured_stones(state: np.ndarray, marked: np.ndarray, exclude_color: int = EMPTY) -> None:
     """
     Снимает с доски отмеченные камни. exclude_color используется для защиты своих камней.
     """
@@ -405,13 +256,13 @@ def remove_captured_stones(state: np.ndarray, marked: np.ndarray, exclude_color:
             if marked[x, y] != EMPTY and marked[x, y] != exclude_color:
                 state[x, y] = EMPTY
 
-
 @njit
-def apply_game_of_life(state: np.ndarray, color: int) -> np.ndarray:
+def apply_game_of_life(state: np.ndarray, color: int, future_state: np.ndarray) -> None:
     """
     Применяет один цикл Game of Life для камней указанного цвета.
     """
-    new_state = state.copy()
+
+    np.copyto(future_state, state)
 
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
@@ -429,13 +280,268 @@ def apply_game_of_life(state: np.ndarray, color: int) -> np.ndarray:
             if state[x, y] == color:
                 # Правило выживания
                 if same_color_count not in (2, 3):
-                    new_state[x, y] = EMPTY
+                    future_state[x, y] = EMPTY
             elif state[x, y] == EMPTY:
                 # Правило рождения
                 if same_color_count == 3:
-                    new_state[x, y] = color
+                    future_state[x, y] = color
 
-    return new_state
+    return
+
+@njit
+def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.ndarray, queue_x : np.ndarray, queue_y : np.ndarray) -> None:
+    """
+    Numba-метод для вычисления территорий по правилам Тромпа-Тейлора.
+    """
+    visited.fill(0)
+
+    np.copyto(territory_map, board)
+
+
+    # Заранее выделяем память под массивы для BFS очереди
+    queue_x.fill(0)
+    queue_y.fill(0)
+    #queue_y = np.zeros(board_size_sqr, dtype=np.int32)
+
+    # Векторы направлений для 4 соседей
+    dx = np.array([-1, 1, 0, 0], dtype=np.int32)
+    dy = np.array([0, 0, -1, 1], dtype=np.int32)
+
+    for x in range(BOARD_SIZE):
+        for y in range(BOARD_SIZE):
+            if board[x, y] == EMPTY and not visited[x, y]:
+                # Инициализация BFS
+                head = 0
+                tail = 0
+
+                # Добавляем стартовую ячейку
+                queue_x[tail] = x
+                queue_y[tail] = y
+                tail += 1
+                visited[x, y] = True
+
+                found_color = EMPTY
+                is_mixed = False
+
+                # BFS-цикл
+                while head < tail:
+                    cx = queue_x[head]
+                    cy = queue_y[head]
+                    head += 1
+
+                    # Проверяем 4 соседей
+                    for i in range(4):
+                        nx = cx + dx[i]
+                        ny = cy + dy[i]
+
+                        # Проверка границ доски
+                        if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+                            n_val = board[nx, ny]
+
+                            if n_val == EMPTY:
+                                if not visited[nx, ny]:
+                                    visited[nx, ny] = True
+                                    queue_x[tail] = nx
+                                    queue_y[tail] = ny
+                                    tail += 1
+                            else:
+                                # Сосед — камень. Проверяем цвета.
+                                if found_color == EMPTY:
+                                    found_color = n_val
+                                elif found_color != n_val:
+                                    is_mixed = True
+
+                # Если регион окружен камнями только одного цвета (и это не полностью пустая доска)
+                if found_color != EMPTY and not is_mixed:
+                    # Вся история посещений региона уже лежит в массиве queue от 0 до tail
+                    for i in range(tail):
+                        rx = queue_x[i]
+                        ry = queue_y[i]
+                        territory_map[rx, ry] = found_color
+
+    return
+
+@njit
+def get_opponent(color: int) -> int:
+    """Получить цвет оппонента."""
+    return WHITE if color == BLACK else BLACK
+
+def generate_zobrist_table() -> np.ndarray:
+    """
+    Создает таблицу 256-битных (4 x uint64) случайных чисел для каждой клетки и состояния.
+    Размер: (BOARD_SIZE, BOARD_SIZE, 3, 4), где 3 - это состояния (Пусто, Игрок 1, Игрок 2).
+    """
+
+    z_table = np.zeros((BOARD_SIZE, BOARD_SIZE, 3, 4), dtype=np.uint64)
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            for state_idx in range(3):
+                for part in range(4):
+                    # Генерируем два 32-битных числа и склеиваем в 64-битное
+                    # (это платформонезависимый и безопасный способ генерации uint64)
+                    high = np.random.randint(0, 2 ** 32, dtype=np.uint64)
+                    low = np.random.randint(0, 2 ** 32, dtype=np.uint64)
+                    z_table[r, c, state_idx, part] = (high << 32) | low
+    return z_table
+
+@njit(cache=True, fastmath=True)
+def compute_zobrist_hash_numba(state: np.ndarray, z_table: np.ndarray, zobrist_hash: np.ndarray) -> None:
+    """
+    Вычисляет 256-битный хеш доски (возвращает массив из 4 uint64).
+    """
+    rows, cols = state.shape
+
+    #h = np.zeros(4, dtype=np.uint64)
+    zobrist_hash.fill(0)
+
+    for r in range(rows):
+        for c in range(cols):
+            val = state[r, c]
+
+            # Маппинг цвета камня в индекс таблицы [0, 1, 2].
+            # Подкорректируйте, если ваши цвета (1 и -1)
+            idx = 0
+            if val != EMPTY:
+                idx = 1 if val == BLACK else 2  # Например, 1 -> 1, 2 (или -1) -> 2
+
+            zobrist_hash[0] ^= z_table[r, c, idx, 0]
+            zobrist_hash[1] ^= z_table[r, c, idx, 1]
+            zobrist_hash[2] ^= z_table[r, c, idx, 2]
+            zobrist_hash[3] ^= z_table[r, c, idx, 3]
+
+    return
+
+@njit
+def game_of_life_with_captures(current_state: np.ndarray, future_state: np.ndarray, visited: np.ndarray, marked_for_death:np.ndarray, group_array:np.ndarray, player_color : int = EMPTY) -> None:
+
+    apply_game_of_life(current_state, player_color, future_state)
+
+    check_captures(future_state, visited, marked_for_death, group_array)
+
+    remove_captured_stones(future_state, marked_for_death, exclude_color=player_color)
+
+    check_captures(future_state, visited, marked_for_death, group_array)
+
+    remove_captured_stones(future_state, marked_for_death)
+
+    return
+
+@njit(cache=True)
+def check_superko_numba(state_hash: np.ndarray, hash_history: np.ndarray, count: int) -> bool:
+    """
+    Проверяет, встречался ли state_hash в истории hash_history.
+    Returns: True - если ход легален (повторов нет), False - если это суперко (повтор).
+    """
+    for i in range(count):
+        # Строгое совпадение всех 256 бит (всех 4 частей)
+        if (hash_history[i, 0] == state_hash[0] and
+                hash_history[i, 1] == state_hash[1] and
+                hash_history[i, 2] == state_hash[2] and
+                hash_history[i, 3] == state_hash[3]):
+            return False
+    return True
+
+@njit(cache=True)
+def position_permissions_numba(
+        current_state: np.ndarray,
+        history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
+        hash_count: int,  # Текущее количество хешей в буфере
+        zobrist_table: np.ndarray,  # Таблица для вычисления хешей
+        current_player: int,
+        x: int, y: int,
+        future_state_1 : np.ndarray,
+        future_state_2 : np.ndarray,
+
+        visited: np.ndarray,
+        marked_for_death:np.ndarray,
+        group_array:np.ndarray,
+
+        zobrist_hash1 :np.ndarray,
+        zobrist_hash2 :np.ndarray
+
+) -> Tuple[bool, bool]:
+    # --- Быстрые проверки ---
+    if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
+        return False, False
+
+    if current_state[x, y] != EMPTY:
+        return False, False
+
+    # --- ШАГ 1: Симуляция постановки камня ---
+
+    future_state_1[:] = current_state
+
+    future_state_1[x, y] = current_player
+
+
+    any_capture = check_captures_local(x,y, future_state_1, marked_for_death, visited, group_array)
+    if any_capture:
+        remove_captured_stones(future_state_1, marked_for_death, current_player)
+
+    # Проверка на самоубийственный ход (используем распаковку 3 значений из новой версии функции)
+    size, liberties = find_group_and_liberties(x, y, future_state_1, group_array, visited)
+    if liberties == 0:
+        return False, False
+
+    # Проверка правила Суперко (Зобристово хеширование)
+    compute_zobrist_hash_numba(future_state_1, zobrist_table, zobrist_hash1)
+    if not check_superko_numba(zobrist_hash1, history_hashes, hash_count):
+        return False, False
+
+    # --- ШАГ 2: Симуляция цикла жизни (Game of Life) ---
+    game_of_life_with_captures(future_state_1, future_state_2, visited, marked_for_death, group_array, current_player)
+
+    # Финальная проверка Суперко для второй стадии
+    compute_zobrist_hash_numba(future_state_2, zobrist_table, zobrist_hash2)
+    if not check_superko_numba(zobrist_hash2, history_hashes, hash_count):
+        return True, False
+
+    # Проверка, не сцепился ли Game of Life с камнем, вернув доску в future_state_1
+    if (zobrist_hash1[0] == zobrist_hash2[0] and zobrist_hash1[1] == zobrist_hash2[1] and
+            zobrist_hash1[2] == zobrist_hash2[2] and zobrist_hash1[3] == zobrist_hash2[3]):
+        return True, False
+
+    # Если все проверки пройдены, ход полностью легален
+    return True, True
+
+@njit(parallel=True)
+def get_legal_moves_mask_numba(
+        current_state: np.ndarray,
+        history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
+        hash_count: int,  # Текущее количество хешей в буфере
+        zobrist_table: np.ndarray,  # Таблица для вычисления хешей
+        current_player: int,
+        out: np.ndarray,
+
+        future_state_1: np.ndarray,
+        future_state_2: np.ndarray,
+
+        visited: np.ndarray,
+        marked_for_death: np.ndarray,
+        group_array: np.ndarray,
+
+        zobrist_hash1: np.ndarray,
+        zobrist_hash2: np.ndarray
+) -> None:
+
+    # prange распараллеливает внешний цикл
+
+    for x in prange(BOARD_SIZE):
+        for y in range(BOARD_SIZE):
+            placement, gol = position_permissions_numba(current_state, history_hashes, hash_count, zobrist_table, current_player, x, y,
+                                                        future_state_1, future_state_2, visited, marked_for_death, group_array, zobrist_hash1, zobrist_hash2)
+
+            if placement:
+                idx_no_life = x * BOARD_SIZE + y
+                out[idx_no_life] = 1.0
+
+            if gol:
+                idx_with_life = BOARD_SIZE * BOARD_SIZE + (x * BOARD_SIZE + y)
+                out[idx_with_life] = 0.0
+
+    # Пас всегда легален
+    out[BOARD_SIZE * BOARD_SIZE * 2] = 1.0
+
 
 
 class Board:
@@ -445,67 +551,142 @@ class Board:
     Управляет состоянием игры, валидацией и применением ходов.
     """
 
-    # Константы
-    BOARD_SIZE = BOARD_SIZE
-    EMPTY = 0
-    BLACK = 1
-    WHITE = 2
+    cached_zobrist_table = None
 
     def __init__(self):
         """Инициализация доски."""
-        self.current_state = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
-        self.future_state_1 = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
-        self.future_state_2 = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
-        self.history_stack = deque()
-        for i in range(4):
-            empty = np.zeros((Board.BOARD_SIZE, Board.BOARD_SIZE), dtype=np.int8)
-            self.history_stack.append(empty)
 
-    def get_opponent(self, color: int) -> int:
-        """Получить цвет оппонента."""
-        return self.WHITE if color == self.BLACK else self.BLACK
+        self.current_state = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+        self.future_state_1 = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+        self.future_state_2 = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
 
-    def is_valid_position(self, x: int, y: int) -> bool:
-        """Проверить, находится ли позиция в пределах доски."""
-        return 0 <= x < self.BOARD_SIZE and 0 <= y < self.BOARD_SIZE
+        if Board.cached_zobrist_table is None:
+            self.zobrist_table = generate_zobrist_table()
+            Board.cached_zobrist_table = self.zobrist_table
+        else:
+            self.zobrist_table = Board.cached_zobrist_table
 
-    def find_group_and_liberties(self, x: int, y: int, state: np.ndarray) -> Tuple[np.ndarray, int]:
-        """Обертка для вызова njit-версии find_group_and_liberties."""
-        return find_group_and_liberties(x, y, state)
+        self.history_stack = np.zeros((NN_HISTORY, BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
 
-    def check_captures(self, state: np.ndarray) -> np.ndarray:
-        """Обертка для вызова njit-версии check_captures."""
-        return check_captures(state)
+        # ИСТОРИЯ ХЕШЕЙ (нужна исключительно для быстрой работы правила Суперко)
+        self.history_hashes = np.zeros((MAX_HISTORY, 4), dtype=np.uint64)
 
-    def remove_captured_stones(self, state: np.ndarray, marked: np.ndarray, exclude_color: Optional[int] = None):
-        """Обертка для вызова njit-версии remove_captured_stones."""
-        # Numba плохо работает с Optional[int], поэтому передаем -1 как маркер отсутствия значения
-        exclude_val = exclude_color if exclude_color is not None else -1
-        remove_captured_stones(state, marked, exclude_val)
+        self.history_ptr = 0
+        self.history_hash_ptr = 0
 
-    def apply_game_of_life(self, state: np.ndarray, color: int) -> np.ndarray:
-        """Обертка для вызова njit-версии apply_game_of_life."""
-        return apply_game_of_life(state, color)
+        self.history_count = 0
+        self.history_hash_count = 0
 
-    def check_ko_rule(self, state: np.ndarray, active_color : int) -> bool:
-        history_np = self.get_history_np()
-        return check_megako_numba(state, history_np, active_color)
+        self.temp_hash_1 =  np.zeros(4, dtype=np.uint64)
+        self.temp_hash_2 =  np.zeros(4, dtype=np.uint64)
 
-    def get_history_np(self):
-        #if len(self.history_stack) > 4:
-        #    history_np = np.stack(list(self.history_stack), axis=0)
-        #else:
-        #    history_np = np.zeros((4, Board.BOARD_SIZE, Board.BOARD_SIZE), dtype=np.int8)
+        self.temp_group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
+        self.temp_marked_for_death = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+        self.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.bool_)
 
-        history_np = np.stack(list(self.history_stack), axis=0)
-        return history_np
+        self.temp_queue_x = np.zeros(board_size_sqr, dtype=np.int32)
+        self.temp_queue_y = np.zeros(board_size_sqr, dtype=np.int32)
+
+        self.tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, IN_CHANNELS), dtype=np.float32)
+
+    def clear(self):
+        self.current_state.fill(0)
+        self.history_stack.fill(0)
+        self.history_hashes.fill(0)
+
+        self.history_ptr = 0
+        self.history_hash_ptr = 0
+
+        self.history_count = 0
+        self.history_hash_count = 0
+
+    def clone(self):
+        new_board = self.__class__.__new__(self.__class__)
+
+        # Копируем текущие и будущие состояния
+        new_board.current_state = self.current_state.copy()
+        new_board.future_state_1 = self.future_state_1.copy()
+        new_board.future_state_2 = self.future_state_2.copy()
+
+        # Zobrist-таблица неизменна для конкретного размера доски,
+        # поэтому просто передаем ссылку (экономим память и время)
+        new_board.zobrist_table = self.zobrist_table
+
+        # Копируем массивы истории
+        new_board.history_stack = self.history_stack.copy()
+        new_board.history_hashes = self.history_hashes.copy()
+
+        # Копируем скалярные значения указателей и счетчиков (передаются по значению)
+        new_board.history_ptr = self.history_ptr
+        new_board.history_hash_ptr = self.history_hash_ptr
+        new_board.history_count = self.history_count
+        new_board.history_hash_count = self.history_hash_count
+
+        new_board.temp_hash_1 =  np.zeros(4, dtype=np.uint64)
+        new_board.temp_hash_2 =  np.zeros(4, dtype=np.uint64)
+
+        new_board.temp_group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
+        new_board.temp_marked_for_death = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+        new_board.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.bool_)
+
+        new_board.temp_queue_x = np.zeros(board_size_sqr, dtype=np.int32)
+        new_board.temp_queue_y = np.zeros(board_size_sqr, dtype=np.int32)
+
+        new_board.tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, IN_CHANNELS), dtype=np.float32)
+
+        return new_board
+
+    def copy(self, target: 'Board'):
+        # Копируем содержимое массивов (in-place перезапись памяти)
+        np.copyto(target.current_state, self.current_state)
+
+        np.copyto(target.history_stack, self.history_stack)
+        np.copyto(target.history_hashes, self.history_hashes)
+
+        # Альтернативный вариант записи (делает то же самое):
+        # target.current_state[:] = self.current_state
+
+        # Копируем примитивные типы (скаляры)
+        target.history_ptr = self.history_ptr
+        target.history_hash_ptr = self.history_hash_ptr
+        target.history_count = self.history_count
+        target.history_hash_count = self.history_hash_count
+
+        np.copyto(target.tensor, self.tensor)
+
+    def push_to_history(self, state: np.ndarray):
+        """
+        Добавляет состояние в кольцевой буфер истории позиций и сохраняет его хеш.
+        """
+        # Считаем 256-битный хеш
+        compute_zobrist_hash_numba(state, self.zobrist_table, self.temp_hash_1)
+
+        np.copyto(self.history_stack[self.history_ptr], state)
+        np.copyto(self.history_hashes[self.history_hash_ptr], self.temp_hash_1)
+
+        self.history_ptr = (self.history_ptr + 1) % NN_HISTORY
+        self.history_hash_ptr = (self.history_hash_ptr + 1) % MAX_HISTORY
+
+        if self.history_count < NN_HISTORY:
+            self.history_count += 1
+
+        if self.history_hash_count < MAX_HISTORY:
+            self.history_hash_count += 1
+
+    def get_legal_moves_mask(self, current_player: int, out: np.ndarray):
+        return get_legal_moves_mask_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
+                                          current_player, out, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
+                                          self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
 
     def make_move(self, move: Move, commit = True) -> (bool, str):
         """
         Применить ход на доске.
+        НЕ ПРОВЕРЯЕТ ХОД. ПРОВЕРКА ОТДЕЛЬНО
 
         Args:
             move: Объект хода
+            commit: Менять ли состояние доски
+            validate: Проверять ли легальность хода
 
         Returns:
             True если ход легален и применен, False если отклонен
@@ -513,107 +694,44 @@ class Board:
         # Обработка паса
         if move.is_pass():
             # Пас не меняет доску, просто переключаем игрока
-            return (True, None)
+            return True, "Pass"
 
         active_color = move.color
+        x, y = move.position
 
-        if move.position is not None:
-            x, y = move.position
+        np.copyto(self.future_state_1, self.current_state)
+        self.future_state_1[x,y] = move.color
 
-            # Проверка базовой легальности позиции
-            if not self.is_valid_position(x, y):
-                return (False, f"Position {x}:{y} is out of range!")
+        any_capture = check_captures_local(x,y, self.future_state_1, self.temp_marked_for_death, self.temp_visited, self.temp_group_array)
+        if any_capture:
+            remove_captured_stones(self.future_state_1, self.temp_marked_for_death, exclude_color=active_color)
 
-            if self.current_state[x, y] != self.EMPTY:
-                return (False, f"Position {x}:{y} is not empty!")
-
-            # ===== ШАГ 1: Установка камня и проверка захватов =====
-            self.future_state_1 = self.current_state.copy()
-            self.future_state_1[x, y] = active_color
-
-            # Проверяем захваты камней оппонента
-            marked = self.check_captures(self.future_state_1)
-
-            # Снимаем камни оппонента
-            self.remove_captured_stones(self.future_state_1, marked, exclude_color=active_color)
-
-            # Проверяем дыхание группы установленного камня
-            group, liberties = self.find_group_and_liberties(x, y, self.future_state_1)
-
-            # Если у группы нет дыханий - самоубийственный ход (нелегален)
-            if liberties == 0:
-                return (False, f"Move {x}:{y} will result in suicide!")
-
-            # Проверка правила "ко" после установки камня
-            if not self.check_ko_rule(self.future_state_1, active_color):
-                return (False, f"Move {x}:{y} violates ko rule!")
-
-        else:
-            self.future_state_1 = self.current_state.copy()
-
-        # ===== ШАГ 2: Цикл жизни (если инициирован) =====
         if move.life_cycles == 1:
-
-            # Применяем цикл жизни к камням активного игрока
-            self.future_state_2 = self.apply_game_of_life(self.future_state_1, active_color)
-
-            # Первая проверка захватов: снимаем камни оппонента
-            marked = self.check_captures(self.future_state_2)
-            self.remove_captured_stones(self.future_state_2, marked, exclude_color=active_color)
-
-            # Вторая проверка захватов: снимаем любые камни без дыханий (самоубийственный цикл)
-            marked = self.check_captures(self.future_state_2)
-            self.remove_captured_stones(self.future_state_2, marked, exclude_color=None)
-
-            # Проверка правила "ко" после цикла жизни
-            if not self.check_ko_rule(self.future_state_2, active_color):
-                return (False, f"GoL iteration will violate ko rule!")
-
-            # Применяем финальное состояние
-            final_state = self.future_state_2
+            game_of_life_with_captures(self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array, active_color)
         else:
-            # Без цикла жизни
-            final_state = self.future_state_1
+            np.copyto(self.future_state_2, self.future_state_1)
 
-        # ===== ШАГ 3: Применение хода =====
-        # Сохраняем текущее состояние в историю
         if commit:
-            self.history_stack.append(self.current_state)
-            self.history_stack.append(self.future_state_1)
+            # Каждый шаг записывается как отдельная позиция в историю
+            self.push_to_history(self.current_state)
+            self.push_to_history(self.future_state_1)
 
             # Обновляем текущее состояние
-            self.current_state = final_state
+            np.copyto(self.current_state, self.future_state_2)
 
-        return (True, "Success")
+        return True, "Success"
 
-    def get_current_state(self) -> np.ndarray:
-        """Получить текущее состояние доски."""
-        return self.current_state.copy()
 
     def __repr__(self) -> str:
         """Строковое представление доски."""
-        stones_black = np.sum(self.current_state == self.BLACK)
-        stones_white = np.sum(self.current_state == self.WHITE)
+        stones_black = np.sum(self.current_state == BLACK)
+        stones_white = np.sum(self.current_state == WHITE)
         return f"Board(black={stones_black}, white={stones_white})"
 
-    def display_board(self) -> str:
+    def board_as_text(self) -> str:
         """
         Визуализировать текущее состояние доски с эмодзи.
-
-        Легенда:
-        - ⚪ (белый круг) = пустая ячейка
-        - ⚫ (черный круг) = черный камень
-        - 🔴 (красный круг) = белый камень
-
-        Returns:
-            Строковое представление доски
         """
-        symbols = {
-            self.EMPTY: '⚪',
-            self.BLACK: '⚫',
-            self.WHITE: '🔴'
-        }
-
         lines = []
 
         for x in range(BOARD_SIZE):
@@ -624,45 +742,28 @@ class Board:
 
         return "\n".join(lines)
 
-    def display_board_with_permissions(self, current_player : int) -> str:
+    def board_with_permissions_as_text(self, current_player : int, mask: np.ndarray) -> str:
         """
         Визуализировать текущее состояние доски с эмодзи.
-
-        Легенда:
-        - ⚪ (белый круг) = пустая ячейка
-        - ⚫ (черный круг) = черный камень
-        - 🔴 (красный круг) = белый камень
-
-        Returns:
-            Строковое представление доски
         """
-        symbols = {
-            self.BLACK: '⚫',
-            self.WHITE: '🔴',
-            self.EMPTY + 10 : '❎',
-            self.EMPTY + 100 : '🟩',
-            self.EMPTY : '⬜',
-        }
 
         lines = []
 
-        history_np = self.get_history_np()
 
         for x in range(BOARD_SIZE):
             row_str = f"{x:2d}|"
             for y in range(BOARD_SIZE):
-                if self.current_state[x,y] != self.EMPTY:
+                if self.current_state[x,y] != EMPTY:
                     row_str += symbols[self.current_state[x, y]] + ""
                 else:
-                    stone, gol = position_permissions_numba(self.current_state, history_np, current_player, x, y)
-                    res = self.EMPTY + (100 if stone and gol else 0) + (10 if stone and not gol else 0)
+                    stone, gol = mask[x * BOARD_SIZE + y], mask[board_size_sqr + x*BOARD_SIZE +y]
+                    res = EMPTY + (100 if stone and gol else 0) + (10 if stone and not gol else 0)
                     row_str += symbols[res] + ""
 
 
             lines.append(row_str)
 
         return "\n".join(lines)
-
 
     def get_score(self) -> dict:
         """
@@ -684,40 +785,29 @@ class Board:
             }
         """
         # Счетчики
-        black_stones = np.sum(self.current_state == self.BLACK)
-        white_stones = np.sum(self.current_state == self.WHITE)
 
-        black_territory = 0
-        white_territory = 0
-        neutral_territory = 0
+        np.equal(self.future_state_1, BLACK, out=self.temp_visited)
+        black_stones = np.count_nonzero(self.temp_visited)
 
-        # Матрица для отслеживания проверенных ячеек
-        visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=bool)
+        np.equal(self.future_state_1, WHITE, out=self.temp_visited)
+        white_stones = np.count_nonzero(self.temp_visited)
 
-        # Обходим доску и ищем пустые регионы
-        for x in range(BOARD_SIZE):
-            for y in range(BOARD_SIZE):
-                # Пропускаем уже проверенные ячейки и занятые камнями
-                if visited[x, y] or self.current_state[x, y] != self.EMPTY:
-                    continue
+        get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x, self.temp_queue_y)
 
-                # Нашли непроверенную пустую ячейку - исследуем регион
-                region, neighbor_colors = self._explore_empty_region(x, y, visited)
+        np.equal(self.future_state_1, BLACK, out=self.temp_visited)
+        black_territory = np.count_nonzero(self.temp_visited) - black_stones
 
-                # Определяем владельца региона по цветам соседей
-                if self.BLACK in neighbor_colors and self.WHITE not in neighbor_colors:
-                    # Регион окружен только черными камнями
-                    black_territory += len(region)
-                elif self.WHITE in neighbor_colors and self.BLACK not in neighbor_colors:
-                    # Регион окружен только белыми камнями
-                    white_territory += len(region)
-                else:
-                    # Регион граничит с обоими цветами - нейтральный
-                    neutral_territory += len(region)
+        np.equal(self.future_state_1, WHITE, out=self.temp_visited)
+        white_territory = np.count_nonzero(self.temp_visited) - white_stones
+
+
+
 
         # Итоговый подсчет по китайским правилам
         black_score = black_stones + black_territory
         white_score = white_stones + white_territory
+
+        neutral_territory = board_size_sqr - black_score - white_score
 
         return {
             'black': black_score,
@@ -729,243 +819,85 @@ class Board:
             'white_territory': white_territory
         }
 
-    def get_territories(self) -> np.ndarray:
+    def get_territories(self, out : np.ndarray) -> None:
         """
         Создает карту контроля территорий по правилам Тромпа-Тейлора (Area scoring).
 
         Returns:
-            np.ndarray: Матрица размера (BOARD_SIZE, BOARD_SIZE) подконтрольных территорий:
+            np.ndarray: Матрица размера (BOARD_SIZE, BOARD_SIZE) подконтрольных территорий.
         """
-        size = self.BOARD_SIZE
-        visited = np.zeros((size, size), dtype=bool)
+        get_territories(self.current_state, self.temp_visited, out, self.temp_queue_x, self.temp_queue_y)
 
-        # Копируем текущее состояние доски, чтобы сразу учесть стоящие камни
-        territory_map = np.copy(self.current_state)
-
-        # Исследуем только пустые регионы
-        for x in range(size):
-            for y in range(size):
-                if self.current_state[x, y] == self.EMPTY and not visited[x, y]:
-                    # Находим пустой регион и цвета окружающих его камней
-                    region, neighbor_colors = self._explore_empty_region(x, y, visited)
-
-                    # Если пустой регион окружен камнями только одного цвета,
-                    # он становится территорией этого цвета
-                    if len(neighbor_colors) == 1:
-                        owner_color = neighbor_colors.pop()
-
-                        # Закрашиваем весь пустой регион цветом владельца
-                        for rx, ry in region:
-                            territory_map[rx, ry] = owner_color
-
-                    # Если len(neighbor_colors) == 2 (касается обоих цветов) - это дамэ, оставляем EMPTY
-                    # Если len(neighbor_colors) == 0 (полностью пустая доска) - оставляем EMPTY
-
-        return territory_map
-
-    def _explore_empty_region(self, x: int, y: int, visited: np.ndarray) -> Tuple[Set[Tuple[int, int]], Set[int]]:
+    def update_network_input(self, current_player_color: int, komi: float) -> None:
         """
-        Исследовать пустой регион методом BFS и найти цвета соседних камней.
-
-        Args:
-            x, y: Начальная позиция пустой ячейки
-            visited: Матрица посещенных ячеек
-
-        Returns:
-            (region, neighbor_colors):
-                - region: множество координат пустых ячеек в регионе
-                - neighbor_colors: множество цветов камней, граничащих с регионом
+        Получить входной тензор для нейросети в формате AlphaGo Zero напрямую из массивов.
+        (Zero-allocation версия)
         """
-        region = set()
-        neighbor_colors = set()
-        queue = deque([(x, y)])
+        half_states = STATES_TO_NN // 2
+        opponent_color = get_opponent(current_player_color)
 
-        while queue:
-            cx, cy = queue.popleft()
+        # Очищаем весь тензор нулями in-place перед началом записи
+        self.tensor.fill(0.0)
 
-            if visited[cx, cy]:
-                continue
+        # === 1. ЗАГЛЯДЫВАНИЕ В БУДУЩЕЕ ===
+        game_of_life_with_captures(self.current_state, self.future_state_1, self.temp_visited,
+                                   self.temp_marked_for_death, self.temp_group_array, current_player_color)
 
-            # Проверяем, что ячейка пустая
-            if self.current_state[cx, cy] != self.EMPTY:
-                continue
+        # Используем np.equal с записью прямо в temp_visited (у него тип bool), чтобы не выделять память
+        np.equal(self.future_state_1, current_player_color, out=self.temp_visited)
+        # Копируем булевы значения в float-тензор (NumPy сам скастует True->1.0, False->0.0)
+        np.copyto(self.tensor[:, :, 0], self.temp_visited)
 
-            visited[cx, cy] = True
-            region.add((cx, cy))
+        game_of_life_with_captures(self.current_state, self.future_state_1, self.temp_visited,
+                                   self.temp_marked_for_death, self.temp_group_array, opponent_color)
 
-            # Проверяем 4 соседей
-            for nx, ny in get_neighbors_4(cx, cy):
-                if self.current_state[nx, ny] == self.EMPTY and not visited[nx, ny]:
-                    # Сосед тоже пустой - добавляем в очередь
-                    queue.append((nx, ny))
-                elif self.current_state[nx, ny] != self.EMPTY:
-                    # Сосед - камень, запоминаем его цвет
-                    neighbor_colors.add(self.current_state[nx, ny])
+        np.equal(self.future_state_1, opponent_color, out=self.temp_visited)
+        np.copyto(self.tensor[:, :, half_states], self.temp_visited)
 
-        return region, neighbor_colors
+        # === 2. ТЕКУЩЕЕ СОСТОЯНИЕ ===
+        if half_states > 1:
+            np.equal(self.current_state, current_player_color, out=self.temp_visited)
+            np.copyto(self.tensor[:, :, 1], self.temp_visited)
 
-    def print_score(self):
-        """Вывести результаты подсчета очков."""
-        score = self.get_score()
+            np.equal(self.current_state, opponent_color, out=self.temp_visited)
+            np.copyto(self.tensor[:, :, half_states + 1], self.temp_visited)
 
-        print("=" * 60)
-        print("ПОДСЧЕТ ОЧКОВ (Китайские правила)")
-        print("=" * 60)
-        print(f"⚫ ЧЕРНЫЕ:")
-        print(f"   Камни на доске: {score['black_stones']}")
-        print(f"   Территория:     {score['black_territory']}")
-        print(f"   ИТОГО:          {score['black']}")
-        print()
-        print(f"🔴 БЕЛЫЕ:")
-        print(f"   Камни на доске: {score['white_stones']}")
-        print(f"   Территория:     {score['white_territory']}")
-        print(f"   ИТОГО:          {score['white']}")
-        print()
-        print(f"⚪ Нейтральные пункты: {score['neutral']}")
-        print("=" * 60)
+        # === 3. ПРОШЛЫЕ СОСТОЯНИЯ (ИЗ КОЛЬЦЕВОГО БУФЕРА) ===
+        history_needed = half_states - 2
 
-    def get_network_input(self, current_player_color: int, states_to_save : int) -> np.ndarray:
-        """
-        Получить входной тензор для нейросети в формате AlphaGo Zero.
+        if history_needed > 0 and self.history_count > 0:
+            states_to_pull = min(history_needed, self.history_count)
 
-        Структура тензора size×size×states_to_save + 1:
-        - Каналы 0-states_to_save / 2 - 1: Позиции камней текущего игрока (последние 8 ходов, от новых к старым)
-        - Каналы states_to_save / 2 - states_to_save - 1: Позиции камней оппонента (последние 8 ходов, от новых к старым)
-        - Канал states_to_save: Индикатор цвета (1.0 если текущий игрок = BLACK, 0.0 если WHITE)
+            # arange создает маленький массив, но это копейки. Для полной паранойи можно держать его предсозданным
+            idx_array = (self.history_ptr - 1 - np.arange(states_to_pull)) % NN_HISTORY
+            past_states = self.history_stack[idx_array]  # Это создает 3D view (если повезет) или массив
 
-        Args:
-            current_player_color: Цвет текущего игрока (BLACK=1 или WHITE=2)
+            # Для 3D истории используем np.equal.
+            # Если вы не хотите выделять временный 3D булев массив,
+            # можно делать это в цикле по каждому состоянию (states_to_pull обычно маленькое, <= 7)
+            for i in range(states_to_pull):
+                state_layer = past_states[i]
 
-        Returns:
-            Тензор размера (BOARD_SIZE, BOARD_SIZE, states_to_save+1) с float32 значениями в диапазоне [0, 1]
-        """
-        tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, states_to_save + 1), dtype=np.float32)
+                # Слой текущего игрока
+                np.equal(state_layer, current_player_color, out=self.temp_visited)
+                np.copyto(self.tensor[:, :, 2 + i], self.temp_visited)
 
-        # Определяем цвет оппонента
-        opponent_color = self.get_opponent(current_player_color)
+                # Слой оппонента
+                np.equal(state_layer, opponent_color, out=self.temp_visited)
+                np.copyto(self.tensor[:, :, half_states + 2 + i], self.temp_visited)
 
-        # Получаем историю позиций (текущая + предыдущие)
-        # history_stack содержит предыдущие состояния, текущее состояние отдельно
-        history_list = list(self.history_stack)  # Копия истории
-
-        all_states =  history_list + [self.current_state.copy()]
-
-        n = int(states_to_save / 2) - 1
-        states_to_use = all_states[-n:][::-1]
-
-        # Заполняем первые 2n каналов историей позиций
-        for i, state in enumerate(states_to_use):
-            # Канал i (0 - n-1): Камни текущего игрока
-            tensor[:, :, i + 1] = (state == current_player_color).astype(np.float32)
-
-            # Канал i+8 (n - 2n-1): Камни оппонента
-            tensor[:, :, i + 1 + int(states_to_save / 2)] = (state == opponent_color).astype(np.float32)
-
-        # Закидываем прогноз на будущее
-        current_state_after_GoL = self.apply_game_of_life(self.current_state, current_player_color)
-        marked = self.check_captures(current_state_after_GoL)
-        self.remove_captured_stones(current_state_after_GoL, marked, exclude_color=current_player_color)
-        marked = self.check_captures(current_state_after_GoL)
-        self.remove_captured_stones(current_state_after_GoL, marked, exclude_color=None)
-        tensor[:,:, 0] = (current_state_after_GoL == current_player_color).astype(np.float32)
-
-        current_state_after_GoL = self.apply_game_of_life(self.current_state, opponent_color)
-        marked = self.check_captures(current_state_after_GoL)
-        self.remove_captured_stones(current_state_after_GoL, marked, exclude_color=opponent_color)
-        marked = self.check_captures(current_state_after_GoL)
-        self.remove_captured_stones(current_state_after_GoL, marked, exclude_color=None)
-        tensor[:,:, int(states_to_save / 2)] = (current_state_after_GoL == opponent_color).astype(np.float32)
+        # === 4. КАНАЛ ЦВЕТА/КОМИ ===
+        # .fill() работает in-place для среза
+        if current_player_color == BLACK:
+            self.tensor[:, :, STATES_TO_NN].fill(-komi)
+        else:
+            self.tensor[:, :, STATES_TO_NN].fill(komi)
 
 
-        # Канал states_to_save: Индикатор цвета текущего игрока
-        # 1.0 для черных (BLACK=1), 0.0 для белых (WHITE=2)
-        if current_player_color == self.BLACK:
-            tensor[:, :, states_to_save] = 1.0
-        else:  # WHITE
-            tensor[:, :, states_to_save] = 0.0
-
-        return tensor
-
-    def get_network_input_pytorch(self, current_player_color: int, states_to_save = 32) -> np.ndarray:
+    def get_network_input_pytorch(self, current_player_color: int, komi: float) -> np.ndarray:
         """
         Получить входной тензор в формате PyTorch (C, H, W).
-
-        Args:
-            current_player_color: Цвет текущего игрока
-
-        Returns:
-            Тензор размера (17, 19, 19) для PyTorch Conv2d
         """
-        # Получаем стандартный тензор (H, W, C)
-        tensor_hwc = self.get_network_input(current_player_color, states_to_save)
-
-        # Транспонируем в (C, H, W) для PyTorch
-        tensor_chw = np.transpose(tensor_hwc, (2, 0, 1))
-
+        self.update_network_input(current_player_color, komi)
+        tensor_chw = np.transpose(self.tensor, (2, 0, 1))
         return tensor_chw
-
-    def from_network_input(self, tensor: np.ndarray) -> int:
-        """
-        Восстанавливает текущее состояние (current_state) и историю (history_stack)
-        из входного тензора нейросети.
-
-        Args:
-            tensor: Тензор размера (BOARD_SIZE, BOARD_SIZE, states_to_save + 1)
-
-        Returns:
-            int: Цвет текущего игрока (восстановленный из тензора)
-        """
-        board_size_y, board_size_x, channels = tensor.shape
-        states_to_save = channels - 1
-        half_states = int(states_to_save / 2)
-        n = half_states - 1
-
-        # 1. Определяем цвет текущего игрока из последнего канала
-        # Проверяем значение в ячейке (0, 0), так как весь слой заполнен одним числом
-        if tensor[0, 0, states_to_save] > 0.0:
-            current_player_color = self.BLACK
-        else:
-            current_player_color = self.WHITE
-
-        opponent_color = self.get_opponent(current_player_color)
-
-        reconstructed_states = []
-
-        # 2. Восстанавливаем состояния
-        # Каналы 0 и half_states пропускаем - там лежат прогнозы Game of Life.
-        # Реальные исторические состояния лежат в индексах от 1 до n.
-        for i in range(1, n + 1):
-            # Создаем пустую доску (0 = пусто)
-            state = np.zeros((board_size_y, board_size_x), dtype=np.int32)
-
-            # Накладываем камни текущего игрока
-            player_mask = tensor[:, :, i] > 0.5
-            state[player_mask] = current_player_color
-
-            # Накладываем камни оппонента
-            opponent_mask = tensor[:, :, i + half_states] > 0.5
-            state[opponent_mask] = opponent_color
-
-            reconstructed_states.append(state)
-
-        # 3. Приводим хронологию в правильный порядок
-        # В тензоре состояния хранились от самого нового (1) к старым (n).
-        # Переворачиваем список, чтобы получить естественный ход времени (от старых к новым).
-        reconstructed_states.reverse()
-
-        # 4. Записываем данные в свойства объекта
-        if reconstructed_states:
-            # Самое новое (последнее в перевернутом списке) - это текущее состояние
-            self.current_state = reconstructed_states[-1]
-
-            # Все предыдущие - это история
-            history_part = reconstructed_states[:-1]
-
-            # Поддерживаем случай, если history_stack реализован как collections.deque
-            if isinstance(self.history_stack, deque):
-                self.history_stack.clear()
-                self.history_stack.extend(history_part)
-            else:
-                self.history_stack = history_part
-
-        return current_player_color

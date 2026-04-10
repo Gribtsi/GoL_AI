@@ -4,6 +4,9 @@ from typing import Union
 import torch
 import torch.nn as nn
 
+from rl_agent import NUM_RES_BLOCKS
+
+
 def init_weights(model: nn.Module):
     """
     Применяет Kaiming и Xavier инициализацию к модели.
@@ -30,7 +33,7 @@ class ModelManager:
     Управляет созданием, сохранением и загрузкой моделей и их чекпоинтов.
     """
 
-    def __init__(self, model_class, save_dir="checkpoints/", device="cpu", NUM_RES_BLOCKS=15):
+    def __init__(self, model_class, save_dir="checkpoints/", device="cpu"):
         """
         Args:
             model_class: Класс вашей нейросети (например, RLAgent).
@@ -39,7 +42,6 @@ class ModelManager:
             **model_kwargs: Аргументы для конструктора модели (например, num_res_blocks=7).
         """
         self.model_class = model_class
-        self.NUM_RES_BLOCKS = NUM_RES_BLOCKS
         self.save_dir = save_dir
         self.device = device
         os.makedirs(self.save_dir, exist_ok=True)
@@ -49,7 +51,7 @@ class ModelManager:
         Создает новый экземпляр модели с правильной случайной инициализацией.
         """
         print("Creating a new model with random weights...")
-        model = self.model_class(self.NUM_RES_BLOCKS).to(self.device)
+        model = self.model_class().to(self.device)
         init_weights(model)  # Применяем нашу функцию инициализации
         return model
 
@@ -108,7 +110,7 @@ class ModelManager:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
 
-        model = self.model_class(self.NUM_RES_BLOCKS).to(self.device)
+        model = self.model_class().to(self.device)
         checkpoint = torch.load(filepath, map_location=self.device)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Model weights loaded from {filepath}")

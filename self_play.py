@@ -1,266 +1,225 @@
 
 import time
+from typing import Tuple
 
 from IPython.display import clear_output
 from numpy.random import random, uniform
+from win32ctypes.pywin32.pywintypes import datetime
 
 from game import Game
-from mcts_agent import MCTS_Agent
+from mcts_agent import MCTS_Agent, DEEP_DEPTH, SHALLOW_DEPTH
 from random_network import RandomNetwork
-from train_data_handle import save_training_data
-from board import BOARD_SIZE, BLACK, EMPTY
+from board import BOARD_SIZE, BLACK, EMPTY, get_opponent
 import numpy as np
+import json
+import h5py
+import uuid
 
-def process_game_history(history: list, final_board_state: np.ndarray, score: dict) -> list:
-    """Добавляет к каждой записи в истории результат игры."""
-    processed = []
-    index = 0
-    for turn_data in history:
-        # Результат с точки зрения текущего игрока
+def process_game_history(history: list, final_board_state: np.ndarray, score: dict) -> dict:
+    """
+    Подготавливает историю игры в виде словаря NumPy-массивов
+    для прямой и быстрой записи в HDF5-датасет.
+    """
+    filtered_history = [turn for turn in history if turn.get('deep_search')]
 
+    num_turns = len(filtered_history)
 
-        winner = score['winner']
+    # Заранее выделяем память под скалярные массивы
+    values = np.zeros(num_turns, dtype=np.float32)
+    scores = np.zeros(num_turns, dtype=np.float32)
+    turns = np.arange(num_turns, dtype=np.int32)
+
+    # Списки для тензоров (размеры могут зависеть от конфигурации,
+    # np.array() в конце соберет их в (N, C, H, W) или подобный формат)
+    state_tensors = []
+    mcts_policies = []
+    territories_list = []
+
+    # Метаданные (например, ходы). HDF5 не любит вложенные словари Python.
+    # Поэтому мы сериализуем словари в JSON-строки или сохраняем как байты.
+    moves_meta = []
+
+    winner = score.get('winner')
+    margin = int(score.get('margin_no_komi', 0))
+
+    for i, turn_data in enumerate(filtered_history):
+
+        if not turn_data['deep_search']:
+            continue
+
         current_player = turn_data['player']
-        margin = int(score['margin_no_komi'])
+
+        # 1. Расчет Value и Score
         if current_player == winner:
-            value = 1.0
-            total_score = margin
-        elif winner is None:  # Ничья
-            value = 0.0
-            total_score = 0
-        else:  # Проигрыш
-            value = -1.0
-            total_score = -margin
+            values[i] = 1.0
+            scores[i] = margin
+        elif winner is None:
+            values[i] = 0.0
+            scores[i] = 0
+        else:
+            values[i] = -1.0
+            scores[i] = -margin
 
-        territories = np.zeros((BOARD_SIZE,BOARD_SIZE), dtype=np.float32)
-        for i in range(BOARD_SIZE):
-            for j in range(BOARD_SIZE):
-                territories[i,j] = 1 if final_board_state[i,j] == current_player else -1 if final_board_state[i,j] != EMPTY else 0
+        # 2. Быстрый расчет территорий (векторизация NumPy вместо двойного цикла)
+        territories = np.zeros_like(final_board_state, dtype=np.float32)
+        territories[final_board_state == current_player] = 1.0
+        territories[(final_board_state != current_player) & (final_board_state != EMPTY)] = -1.0
 
-        move = turn_data['move']
+        # 3. Сбор многомерных тензоров
+        state_tensors.append(turn_data['state_tensor'])
+        mcts_policies.append(turn_data['mcts_policy'])
+        territories_list.append(territories)
 
-        processed.append({
-            'state_tensor': turn_data['state_tensor'],
-            'mcts_policy': turn_data['mcts_policy'],
-            'value': value,
-            'score': total_score,
-            'territories': territories,
-            'turn': index,
-            'move': move.to_dict()
-        })
+        # 4. Обработка метаданных (конвертация словаря в строку для HDF5)
+        move_dict = turn_data['move'].to_dict()
+        moves_meta.append(json.dumps(move_dict).encode('utf-8'))
 
-        index += 1
-    return processed
+    # Возвращаем "колонки" данных
+    return {
+        'state_tensor': np.array(state_tensors, dtype=np.float32),
+        'mcts_policy': np.array(mcts_policies, dtype=np.float32),
+        'value': values,
+        'score': scores,
+        'territories': np.array(territories_list, dtype=np.float32),
+        'turn': turns,
+        # Сохраняем как массив байтовых строк (строковый тип, понятный HDF5)
+        'move_meta': np.array(moves_meta, dtype='S')
+    }
 
-def play_game_with_visualization(
-        rl_agent: MCTS_Agent,
-        random_turns: int = 10, random_agent: MCTS_Agent = None, delay: float = 1.0,
-        max_moves: int = 300, play_until_end_chance = 0.1, concede_value = 0.9, extra_data: str = "") -> (Game, MCTS_Agent):
+
+def save_game_to_hdf5(h5_file_path: str, game_data: dict, game_id: str = None):
     """
-    Запустить одну партию с визуализацией в Jupyter Notebook.
-
-    Args:
-        agent: MCTS агент для игры
-        delay: Задержка между ходами в секундах (минимум 1.0)
-        max_moves: Максимальное количество ходов (защита от зацикливания)
-
-    Returns:
-        game: Финальное состояние игры
+    Сохраняет обработанную партию в HDF5 базу данных.
     """
-    # Создаем новую игру
-    game = Game()
-    move_count = 0
+    if game_id is None:
+        game_id = f"game_{uuid.uuid4().hex}"
+
+    with h5py.File(h5_file_path, 'a') as f:
+        # Создаем директорию (группу) для конкретной партии
+        game_group = f.create_group(game_id)
+
+        # Основные тензоры для обучения (используем компрессию для экономии места)
+        game_group.create_dataset('state_tensor', data=game_data['state_tensor'], compression='lzf')
+        game_group.create_dataset('mcts_policy', data=game_data['mcts_policy'], compression='lzf')
+        game_group.create_dataset('territories', data=game_data['territories'], compression='lzf')
+
+        # Скалярные значения и таргеты
+        game_group.create_dataset('value', data=game_data['value'])
+        game_group.create_dataset('score', data=game_data['score'])
+
+        # Метаданные (переменная длина строк, поэтому указываем спец. формат h5py)
+        game_group.create_dataset('turn', data=game_data['turn'])
+        game_group.create_dataset('move_meta', data=game_data['move_meta'])
+
+        # Если есть общая метадата для всей игры (не по ходам), сохраняем в атрибуты группы:
+        #game_group.attrs['board_size'] = metadata['board_size']
+        #game_group.attrs['komi'] = metadata['komi']
+        #game_group.attrs['max_komi'] = metadata['max_komi']
+
+UNTIL_THE_END_CHANCE = 0.1
+CONCEDE_AT = 0.9
 
 
-    till_the_end = (uniform(0,1) <= play_until_end_chance)
-    concede_at = concede_value
+DEEP_SEARCH_CHANCE = 0.25
 
-    print("=" * 60)
-    print("НАЧАЛО ИГРЫ: MCTS Agent (Self-Play)")
-    print(f"Симуляций MCTS на ход: {rl_agent.num_simulations}")
-    print(f"Температура: {rl_agent.temperature}")
-    print("=" * 60)
-    time.sleep(2)
+def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, extra_text : str = None) -> Tuple[list, Game]:
+
+    game = agent.root.game_state
+
+    till_the_end = (uniform(0,1) <= UNTIL_THE_END_CHANCE)
 
     best_node = None
+    history = []
 
-    turn_index = 0
-
-    # Игровой цикл
-    while (not game.game_over) and (move_count < max_moves):
-        clear_output(wait=True)
-
-        # Отображаем текущее состояние
+    if visualise:
         print("=" * 60)
-        print(f"ХОД {move_count + 1} | {extra_data} | до конца {till_the_end}")
+        print("НАЧАЛО ИГРЫ")
         print("=" * 60)
-        game.print_board()
-        print()
 
-        if not (random_agent is None) and turn_index < random_turns:
-            agent = random_agent
-        else:
-            agent = rl_agent
+    if till_the_end:
+        till_the_end_str = ' | до конца'
+    else:
+        till_the_end_str = ''
 
-        # Запускаем MCTS поиск
-        print(f"🔍 MCTS запущен ({agent.num_simulations} симуляций)...")
-        start_time = time.time()
+    while (game is None) or (not game.game_over) and (game.current_move < max_moves):
+
+        if visualise:
+            clear_output(wait=True)
+            print("=" * 60)
+            if extra_text is not None:
+                print(extra_text)
+            print(f"ХОД {game.current_move + 1}{till_the_end_str}")
+            print(game.get_header_text())
+            print("=" * 60)
+
+            print(game.board.board_with_permissions_as_text(game.current_player, game.get_legal_moves_mask()))
+
+
+        is_deep = (uniform(0, 1) <= DEEP_SEARCH_CHANCE)
+
+        depth = DEEP_DEPTH if is_deep else SHALLOW_DEPTH
 
         if best_node is None:
-            move, policy, best_node = agent.search(game)
+            move, policy, best_node = agent.search(num_simulations=depth)
         else:
-            move, policy, best_node = agent.search(game, best_node)
+            move, policy, best_node = agent.search(root=best_node, num_simulations=depth)
 
-        turn_index += 1
+        current_state_tensor = game.get_network_input_pytorch()
 
-        search_time = time.time() - start_time
-        print(f"✅ MCTS завершен за {search_time:.2f} сек")
-        print(f"📍 Выбран ход: {move}")
-
-        current_state_tensor = game.get_network_input_pytorch(32)
-        game.history.append({
+        history.append({
             'state_tensor': current_state_tensor,
             'mcts_policy': policy,
             'player': game.current_player,
-            'move': move
+            'move': move,
+            'deep_search': is_deep
         })
 
-        # Применяем ход
-        success = game.make_move(move)
-
-        if not success:
-            raise Exception(f"❌ ОШИБКА: Ход не был применен!")
-
-        move_count += 1
+        game = best_node.game_state
 
         if not till_the_end:
-            print(f"mean value {best_node.mean_value} player {best_node.game_state.current_player} move {best_node.game_state.current_move}")
-            if (best_node.mean_value > concede_at) and (game.get_current_leader() != game.current_player): # У нас инверсия откуда-то яхз взялась, поэтому знак больше
+            if (best_node.mean_value > CONCEDE_AT) and (
+                    game.get_current_leader() != game.current_player):  # У нас инверсия откуда-то яхз взялась, поэтому знак больше
                 game.game_over = True
 
-        if delay - search_time > 0:
-            time.sleep(delay - search_time)
 
-    # Финальное состояние
-    clear_output(wait=True)
-    print("=" * 60)
-    print(f"ИГРА ОКОНЧЕНА! {max_moves}")
-    print("=" * 60)
-    game.print_board()
-    print()
 
-    # Подсчет очков
-    game.print_score()
-    print()
-    print(f"Всего ходов: {move_count}")
+    if visualise:
+        clear_output(wait=True)
+        print("=" * 60)
+        if extra_text is not None:
+            print(extra_text)
+        print(f"Игра окончена за {game.current_move} ходов!")
+        print(game.get_winner_text())
+        print("=" * 60)
+        print(game.board.board_with_permissions_as_text(game.current_player, game.get_legal_moves_mask()))
+        print()
 
-    if move_count >= max_moves:
-        print(f"⚠️  Достигнут лимит ходов ({max_moves})")
+        # Подсчет очков
+        game.print_score()
 
-    return game, rl_agent
-
+    return history, game
 
 def generate_self_play_games(
         games_to_generate: int, games_batch: int,
         rl_agent: MCTS_Agent, max_moves: int,
-        data_save_dir: str, random_moves : int = 0, random_mcts : int = 2, delay : float = 1, play_until_end_chance = 0.9, concede_value = 0.9):
-    random = RandomNetwork()
-    agent_random = MCTS_Agent(random, num_simulations=random_mcts, temperature=1.0)
-
-
+        file_path: str):
 
     for k in range(int(games_to_generate / games_batch) if games_batch < games_to_generate else 1):
-        all_training_data = []
         start_time = time.time()
         for i in range(games_batch if games_batch < games_to_generate else games_to_generate):
+
             text = f"ИГРА {i + 1 + k * games_batch}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
-            game_result, agent = play_game_with_visualization(rl_agent=rl_agent, random_agent=agent_random, random_turns=random_moves,
-                                                       delay=delay, max_moves=max_moves, extra_data=text, play_until_end_chance=play_until_end_chance, concede_value=concede_value)
+
+            history, game = self_play(agent=rl_agent, max_moves=max_moves, extra_text=text)
+
+            game_data = process_game_history(
+                history=history,
+                final_board_state=game.board.current_state,
+                score=game.get_score(),
+            )
+
+            game_id = f"game_{i:05d}_{datetime.now()}_{uuid.uuid4().hex[:8]}"
+
+            save_game_to_hdf5(file_path, game_data, game_id=game_id)
 
 
-
-
-            # Обрабатываем историю, добавляя итоговый результат
-
-            processed_history = process_game_history(game_result.history, game_result.board.get_territories(), game_result.get_score())
-
-
-
-            all_training_data.extend(processed_history)
-
-            # --- Блок сохранения данных ---
-
-        print(f"\nЭтап {k} сбора данных завершен. Собрано {len(all_training_data)} состояний.")
-
-        if not save_training_data(save_dir=data_save_dir, training_data=all_training_data):
-            print(f"\n❌ Ошибка при сохранении батча игр. Генерация остановлена.")
-            break
-
-    return agent_random
-
-def play_tournament_game(player1: MCTS_Agent, player2: MCTS_Agent, max_moves: int = 300, extra_text=""):
-    """
-    Запускает одну быструю партию между двумя агентами без визуализации.
-
-    Args:
-        player1 (MCTS_Agent): Агент, играющий за Черных (ходит первым).
-        player2 (MCTS_Agent): Агент, играющий за Белых.
-        max_moves (int): Максимальное количество ходов для предотвращения зацикливания.
-
-    Returns:
-        Game: Объект с финальным состоянием игры.
-    """
-    # 1. Создание новой игры
-    game = Game()
-    move_count = 0
-
-    # Игровой цикл
-    while not game.game_over and move_count < max_moves:
-
-        clear_output(wait=True)
-
-        # Отображаем текущее состояние
-        print("=" * 60)
-        print(f"| ХОД {move_count + 1} | {extra_text} |")
-        print("=" * 60)
-        game.print_board()
-        print()
-
-        # 2. Выбор текущего агента в зависимости от цвета игрока
-        if game.current_player == game.board.BLACK:
-            current_agent = player1
-        else:
-            current_agent = player2
-
-        # Запускаем MCTS поиск
-        print(f"🔍 MCTS запущен ({current_agent.num_simulations} симуляций)...")
-        start_time = time.time()
-
-        # 3. Запуск MCTS поиска для текущего агента
-        # Мы не сохраняем историю и политику, так как в турнире нас интересует только результат
-        move, _, _ = current_agent.search(game)
-
-        search_time = time.time() - start_time
-        print(f"✅ MCTS завершен за {search_time:.2f} сек")
-        print(f"📍 Выбран ход: {move}")
-
-        # 4. Применение хода
-        success = game.make_move(move)
-
-        if not success:
-            print(f"❌ ОШИБКА: Агент {game.current_player} сделал нелегальный ход {move}!")
-            # В этом случае нужно присвоить победу оппоненту
-            game.winner = game.get_opponent(game.current_player)
-            game.game_over = True
-            break  # Прерываем игру
-
-        move_count += 1
-
-    # Если игра не завершилась по правилам (например, два паса),
-    # но достигнут лимит ходов, победитель определяется по очкам.
-    if not game.game_over:
-        score = game.get_score()
-        game.winner = score.get('winner')
-        game.game_over = True
-
-    return game

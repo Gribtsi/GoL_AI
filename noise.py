@@ -51,7 +51,6 @@ class DirichletNoiseConfig:
         # Смешиваем policy с шумом
         noisy_policy = (1 - self.epsilon) * policy + self.epsilon * noise
 
-        # Нормализуем на всякий случай
         noisy_policy = noisy_policy / np.sum(noisy_policy)
 
         return noisy_policy

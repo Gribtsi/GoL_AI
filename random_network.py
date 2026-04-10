@@ -8,7 +8,7 @@ from torch.distributions import Dirichlet
 from torch.nn.parallel.scatter_gather import scatter_kwargs
 
 import board
-from game import Game, decode_action, board_size_sqr
+from game import Game, decode_move, board_size_sqr
 
 import numpy as np
 
@@ -35,40 +35,6 @@ class RandomNetwork(NetworkBase):
         self.value_modifier = 1
         self.local_board = Board()
 
-    def do_rollout(self, state: np.ndarray, policy : np.ndarray) -> float:
-
-        score = 0
-        current_player = board.BLACK if state[32, 0, 0] > 0 else board.WHITE
-
-        game = Game()
-        game.current_player = current_player
-        game.board.from_network_input(state)
-
-        for i in range(self.rollout_games):
-
-            game.current_player = current_player
-            game.board.from_network_input(state)
-
-            for j in range(self.rollout_turns):
-                mask = game.get_legal_moves_mask_simple()
-
-                masked_policy = policy * mask
-                masked_policy = masked_policy / sum(masked_policy)
-                action_idx = np.random.choice(BOARD_SIZE * BOARD_SIZE * 2 + 1, p=masked_policy)
-
-                move = decode_action(action_idx, game.current_player)
-                game.make_move(move)
-                if game.game_over:
-                    break
-
-            if game.get_current_leader() == current_player:
-                score += 1
-            else:
-                score -= 1
-
-        value = score / self.rollout_games
-
-        return  value
 
     def predict(self, state: np.ndarray, **kwargs):
         """
@@ -179,18 +145,11 @@ class PytorchAgentWrapper(NetworkBase):
         return policy_probabilities, np.float32(value_scalar), score_logits
 
 
-
-
-
-
-
-
-
 def create_and_get_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Создаем экземпляр вашей нейросети
-    pytorch_model = RLAgent(num_res_blocks=15)
+    pytorch_model = RLAgent()
 
     # (Опционально) Загружаем веса обученной модели
     # pytorch_model.load_state_dict(torch.load("best_model.pth"))
