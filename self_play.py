@@ -3,17 +3,21 @@ import time
 from typing import Tuple
 
 from IPython.display import clear_output
-from numpy.random import random, uniform
+from numpy.random import uniform
 from win32ctypes.pywin32.pywintypes import datetime
 
 from game import Game
-from mcts_agent import MCTS_Agent, DEEP_DEPTH, SHALLOW_DEPTH
-from random_network import RandomNetwork
-from board import BOARD_SIZE, BLACK, EMPTY, get_opponent
+from mcts_agent import MCTS_Agent
+from move import move_to_dict
+from config import EMPTY, DEEP_DEPTH, SHALLOW_DEPTH, UNTIL_THE_END_CHANCE, CONCEDE_AT, \
+    DEEP_SEARCH_CHANCE
 import numpy as np
 import json
 import h5py
 import uuid
+
+from random_komi import generate_komi
+
 
 def process_game_history(history: list, final_board_state: np.ndarray, score: dict) -> dict:
     """
@@ -71,7 +75,7 @@ def process_game_history(history: list, final_board_state: np.ndarray, score: di
         territories_list.append(territories)
 
         # 4. Обработка метаданных (конвертация словаря в строку для HDF5)
-        move_dict = turn_data['move'].to_dict()
+        move_dict = move_to_dict(*turn_data['move'])
         moves_meta.append(json.dumps(move_dict).encode('utf-8'))
 
     # Возвращаем "колонки" данных
@@ -116,17 +120,16 @@ def save_game_to_hdf5(h5_file_path: str, game_data: dict, game_id: str = None):
         #game_group.attrs['komi'] = metadata['komi']
         #game_group.attrs['max_komi'] = metadata['max_komi']
 
-UNTIL_THE_END_CHANCE = 0.1
-CONCEDE_AT = 0.9
-
-
-DEEP_SEARCH_CHANCE = 0.25
 
 def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, extra_text : str = None) -> Tuple[list, Game]:
 
     game = agent.root.game_state
 
-    till_the_end = (uniform(0,1) <= UNTIL_THE_END_CHANCE)
+    komi, flat_komi = generate_komi()
+
+    game.set_komi(komi)
+
+    till_the_end = flat_komi or (uniform(0,1) <= UNTIL_THE_END_CHANCE)
 
     best_node = None
     history = []
@@ -160,17 +163,17 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
         depth = DEEP_DEPTH if is_deep else SHALLOW_DEPTH
 
         if best_node is None:
-            move, policy, best_node = agent.search(num_simulations=depth)
+            x, y, life_cycle, color, is_pass, policy, best_node = agent.search(num_simulations=depth)
         else:
-            move, policy, best_node = agent.search(root=best_node, num_simulations=depth)
+            x, y, life_cycle, color, is_pass, policy, best_node = agent.search(root=best_node, num_simulations=depth)
 
         current_state_tensor = game.get_network_input_pytorch()
 
         history.append({
-            'state_tensor': current_state_tensor,
+            'state_tensor': current_state_tensor.copy(),
             'mcts_policy': policy,
             'player': game.current_player,
-            'move': move,
+            'move': move_to_dict(x, y, life_cycle, color, is_pass),
             'deep_search': is_deep
         })
 
@@ -180,8 +183,6 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
             if (best_node.mean_value > CONCEDE_AT) and (
                     game.get_current_leader() != game.current_player):  # У нас инверсия откуда-то яхз взялась, поэтому знак больше
                 game.game_over = True
-
-
 
     if visualise:
         clear_output(wait=True)
@@ -204,8 +205,9 @@ def generate_self_play_games(
         rl_agent: MCTS_Agent, max_moves: int,
         file_path: str):
 
+    start_time = time.time()
     for k in range(int(games_to_generate / games_batch) if games_batch < games_to_generate else 1):
-        start_time = time.time()
+
         for i in range(games_batch if games_batch < games_to_generate else games_to_generate):
 
             text = f"ИГРА {i + 1 + k * games_batch}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
@@ -222,4 +224,4 @@ def generate_self_play_games(
 
             save_game_to_hdf5(file_path, game_data, game_id=game_id)
 
-
+            rl_agent.flush()

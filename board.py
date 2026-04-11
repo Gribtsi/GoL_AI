@@ -1,77 +1,12 @@
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple
 import numpy as np
-from fontTools.svgLib.path.parser import BOOL_RE
 from numba import njit, prange
 
-class Move:
-    """Класс для представления хода в игре Go + Game of Life."""
-
-    EMPTY = 0
-    BLACK = 1
-    WHITE = 2
-
-    def __init__(self, position: Optional[Tuple[int, int]], life_cycles: int, color: int, is_pass: bool = False):
-        """
-        Args:
-            position: Координаты (x, y) для установки камня, None для паса
-            life_cycles: Количество циклов жизни после установки (0 или 1)
-            color: Цвет игрока (1 - черные, 2 - белые)
-        """
-        self.position = position
-        self.life_cycles = life_cycles
-        self.color = color
-        self.__is_pass = is_pass
-
-    def is_pass(self) -> bool:
-        """Проверка, является ли ход пасом."""
-        return self.__is_pass
-
-    def __repr__(self) -> str:
-        if self.is_pass():
-            return f"Move(PASS, color={self.color})"
-        return f"Move(pos={self.position}, life_cycles={self.life_cycles}, color={self.color})"
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Конвертирует объект в словарь для JSON-сериализации."""
-        return {
-            "position": self.position,
-            "life_cycles": self.life_cycles,
-            "color": self.color,
-            "is_pass": self.__is_pass
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Move":
-        """Создает объект из словаря (после JSON-десериализации)."""
-        # JSON конвертирует tuple в list, поэтому возвращаем формат обратно
-        pos = data.get("position")
-        position = tuple(pos) if pos is not None else None
-
-        return cls(
-            position=position,
-            life_cycles=data.get("life_cycles", 0),
-            color=data.get("color", cls.EMPTY),
-            is_pass=data.get("is_pass", False)
-        )
+from config import BOARD_SIZE, board_size_sqr, EMPTY, BLACK, WHITE, NN_HISTORY, MAX_HISTORY, STATES_TO_NN, IN_CHANNELS, \
+    symbols
 
 
 # --- Константы и вспомогательные функции, также помеченные @njit ---
-
-BOARD_SIZE = 7
-board_size_sqr = BOARD_SIZE * BOARD_SIZE
-possible_moves_total = BOARD_SIZE * BOARD_SIZE * 2 + 1
-
-MAX_KOMI = 15
-
-EMPTY = 0
-BLACK = 1
-WHITE = 2
-
-NN_HISTORY = 100
-MAX_HISTORY = 1000
-
-STATES_TO_NN = 32
-IN_CHANNELS = STATES_TO_NN + 1
 
 """
 Легенда:
@@ -81,13 +16,7 @@ IN_CHANNELS = STATES_TO_NN + 1
 - ❎ = можно поставить камень, но не провести цикл жизни
 - 🟩 = можно установить камень и затем провести цикл жизни
 """
-symbols = {
-    BLACK: '⚫',
-    WHITE: '🔴',
-    EMPTY + 10 : '❎',
-    EMPTY + 100 : '🟩',
-    EMPTY : '⬜',
-}
+
 
 @njit
 def is_valid_position(x: int, y: int) -> bool:
@@ -262,7 +191,7 @@ def apply_game_of_life(state: np.ndarray, color: int, future_state: np.ndarray) 
     Применяет один цикл Game of Life для камней указанного цвета.
     """
 
-    np.copyto(future_state, state)
+    future_state[:] = state
 
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
@@ -295,7 +224,7 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
     """
     visited.fill(0)
 
-    np.copyto(territory_map, board)
+    territory_map[:] = board
 
 
     # Заранее выделяем память под массивы для BFS очереди
@@ -504,7 +433,7 @@ def position_permissions_numba(
     # Если все проверки пройдены, ход полностью легален
     return True, True
 
-@njit(parallel=True)
+@njit
 def get_legal_moves_mask_numba(
         current_state: np.ndarray,
         history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
@@ -526,18 +455,22 @@ def get_legal_moves_mask_numba(
 
     # prange распараллеливает внешний цикл
 
-    for x in prange(BOARD_SIZE):
+    for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
             placement, gol = position_permissions_numba(current_state, history_hashes, hash_count, zobrist_table, current_player, x, y,
                                                         future_state_1, future_state_2, visited, marked_for_death, group_array, zobrist_hash1, zobrist_hash2)
 
+            idx_no_life = x * BOARD_SIZE + y
             if placement:
-                idx_no_life = x * BOARD_SIZE + y
-                out[idx_no_life] = 1.0
+                out[idx_no_life] = 1
+            else:
+                out[idx_no_life] = 0
 
+            idx_with_life = BOARD_SIZE * BOARD_SIZE + (x * BOARD_SIZE + y)
             if gol:
-                idx_with_life = BOARD_SIZE * BOARD_SIZE + (x * BOARD_SIZE + y)
-                out[idx_with_life] = 0.0
+                out[idx_with_life] = 1
+            else:
+                out[idx_with_life] = 0
 
     # Пас всегда легален
     out[BOARD_SIZE * BOARD_SIZE * 2] = 1.0
@@ -638,13 +571,10 @@ class Board:
 
     def copy(self, target: 'Board'):
         # Копируем содержимое массивов (in-place перезапись памяти)
-        np.copyto(target.current_state, self.current_state)
 
+        np.copyto(target.current_state, self.current_state)
         np.copyto(target.history_stack, self.history_stack)
         np.copyto(target.history_hashes, self.history_hashes)
-
-        # Альтернативный вариант записи (делает то же самое):
-        # target.current_state[:] = self.current_state
 
         # Копируем примитивные типы (скаляры)
         target.history_ptr = self.history_ptr
@@ -661,8 +591,8 @@ class Board:
         # Считаем 256-битный хеш
         compute_zobrist_hash_numba(state, self.zobrist_table, self.temp_hash_1)
 
-        np.copyto(self.history_stack[self.history_ptr], state)
-        np.copyto(self.history_hashes[self.history_hash_ptr], self.temp_hash_1)
+        self.history_stack[self.history_ptr][:] = state
+        self.history_hashes[self.history_hash_ptr][:] = self.temp_hash_1
 
         self.history_ptr = (self.history_ptr + 1) % NN_HISTORY
         self.history_hash_ptr = (self.history_hash_ptr + 1) % MAX_HISTORY
@@ -678,7 +608,7 @@ class Board:
                                           current_player, out, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
                                           self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
 
-    def make_move(self, move: Move, commit = True) -> (bool, str):
+    def make_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, commit = True) -> (bool, str):
         """
         Применить ход на доске.
         НЕ ПРОВЕРЯЕТ ХОД. ПРОВЕРКА ОТДЕЛЬНО
@@ -692,24 +622,21 @@ class Board:
             True если ход легален и применен, False если отклонен
         """
         # Обработка паса
-        if move.is_pass():
+        if is_pass:
             # Пас не меняет доску, просто переключаем игрока
             return True, "Pass"
 
-        active_color = move.color
-        x, y = move.position
-
-        np.copyto(self.future_state_1, self.current_state)
-        self.future_state_1[x,y] = move.color
+        self.future_state_1[:] = self.current_state
+        self.future_state_1[x,y] = color
 
         any_capture = check_captures_local(x,y, self.future_state_1, self.temp_marked_for_death, self.temp_visited, self.temp_group_array)
         if any_capture:
-            remove_captured_stones(self.future_state_1, self.temp_marked_for_death, exclude_color=active_color)
+            remove_captured_stones(self.future_state_1, self.temp_marked_for_death, exclude_color=color)
 
-        if move.life_cycles == 1:
-            game_of_life_with_captures(self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array, active_color)
+        if life_cycles == 1:
+            game_of_life_with_captures(self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array, color)
         else:
-            np.copyto(self.future_state_2, self.future_state_1)
+            self.future_state_2[:] = self.future_state_1
 
         if commit:
             # Каждый шаг записывается как отдельная позиция в историю
@@ -717,7 +644,7 @@ class Board:
             self.push_to_history(self.future_state_1)
 
             # Обновляем текущее состояние
-            np.copyto(self.current_state, self.future_state_2)
+            self.current_state[:] = self.future_state_2
 
         return True, "Success"
 
@@ -756,7 +683,7 @@ class Board:
                 if self.current_state[x,y] != EMPTY:
                     row_str += symbols[self.current_state[x, y]] + ""
                 else:
-                    stone, gol = mask[x * BOARD_SIZE + y], mask[board_size_sqr + x*BOARD_SIZE +y]
+                    stone, gol = mask[x * BOARD_SIZE + y], mask[board_size_sqr + x * BOARD_SIZE + y]
                     res = EMPTY + (100 if stone and gol else 0) + (10 if stone and not gol else 0)
                     row_str += symbols[res] + ""
 

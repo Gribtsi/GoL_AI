@@ -1,130 +1,97 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
-from board import BOARD_SIZE, IN_CHANNELS
-
+from config import BOARD_SIZE, IN_CHANNELS, CONV_CHANNELS, FEATURES, NUM_RES_BLOCKS
 
 class ResBlock(nn.Module):
     """
     Остаточный блок (Residual Block), ключевой компонент архитектуры.
     """
-
     def __init__(self, num_channels):
         super(ResBlock, self).__init__()
-        self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        # ОПТИМИЗАЦИЯ 1: bias=False
+        self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(num_channels)
-        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(num_channels)
 
     def forward(self, x):
         residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
+        # ОПТИМИЗАЦИЯ 2: inplace=True
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
         out = self.bn2(self.conv2(out))
-        out += residual  # Ключевой элемент - сложение с входом
-        out = F.relu(out)
+        out += residual
+        # inplace=True здесь тоже экономит выделение памяти
+        out = F.relu(out, inplace=True)
         return out
 
-
-# --- Определение архитектуры агента ---
-
-
-CONV_CHANNELS = 64
-FEATURES = 64
-NUM_RES_BLOCKS = 7
 
 class RLAgent(nn.Module):
     """
     Нейросетевой агент в стиле AlphaGo Zero.
-
-    Состоит из общего свёрточного "тела" и двух "голов":
-    1. Policy Head: предсказывает вероятность каждого хода.
-    2. Value Head: оценивает вероятность победы из текущей позиции.
     """
-
     def __init__(self):
         super(RLAgent, self).__init__()
 
-        # Входной канал = 33, доска 19x19
-
         # --- 1. Общий ствол (Shared Body) ---
         self.conv_in = nn.Sequential(
-            nn.Conv2d(IN_CHANNELS, CONV_CHANNELS, kernel_size=3, padding=1),
+            nn.Conv2d(IN_CHANNELS, CONV_CHANNELS, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(CONV_CHANNELS),
-            nn.ReLU()
+            nn.ReLU(inplace=True)
         )
 
-        self.res_blocks = nn.ModuleList(
-            [ResBlock(CONV_CHANNELS) for _ in range(NUM_RES_BLOCKS)]
+        # ОПТИМИЗАЦИЯ 3: nn.Sequential вместо for loop по nn.ModuleList
+        self.res_blocks = nn.Sequential(
+            *[ResBlock(CONV_CHANNELS) for _ in range(NUM_RES_BLOCKS)]
         )
 
         # --- 2. Голова Политики (Policy Head) ---
         self.policy_head = nn.Sequential(
-            nn.Conv2d(CONV_CHANNELS, 2, kernel_size=1),
+            nn.Conv2d(CONV_CHANNELS, 2, kernel_size=1, bias=False),
             nn.BatchNorm2d(2),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(2 * BOARD_SIZE * BOARD_SIZE, BOARD_SIZE * BOARD_SIZE * 2 + 1)
         )
 
         # --- 3. Голова Оценки (Value Head) ---
         self.value_head = nn.Sequential(
-            nn.Conv2d(CONV_CHANNELS, 1, kernel_size=1),
+            nn.Conv2d(CONV_CHANNELS, 1, kernel_size=1, bias=False),
             nn.BatchNorm2d(1),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(1 * BOARD_SIZE * BOARD_SIZE, FEATURES),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(FEATURES, 1),
-            nn.Tanh()  # Выход в диапазоне [-1, 1]
+            nn.Tanh()
         )
 
         # --- 4. Голова Территории (Ownership Head) ---
-        # Предсказывает принадлежность каждой клетки на доске.
-        # В отличие от других голов, здесь мы сохраняем пространственную структуру.
         self.territory_head = nn.Sequential(
+            # Здесь bias=True (по умолчанию) оставляем, т.к. нет BatchNorm!
             nn.Conv2d(CONV_CHANNELS, 1, kernel_size=1),
-            # Не используем ReLU и BatchNorm перед Tanh, чтобы не искажать центровку значений
-            nn.Tanh()  # Выход (batch, 1, BOARD_SIZE, BOARD_SIZE) в диапазоне [-1, 1]
+            nn.Tanh()
         )
 
         # --- 5. Голова Счета (Score Head) ---
-        # Предсказывает категориальное распределение счета от -BOARD_SIZE до BOARD_SIZE
-        # Количество классов = BOARD_SIZE * 2 + 1
         self.score_head = nn.Sequential(
-            nn.Conv2d(CONV_CHANNELS, 1, kernel_size=1),
+            nn.Conv2d(CONV_CHANNELS, 1, kernel_size=1, bias=False),
             nn.BatchNorm2d(1),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(1 * BOARD_SIZE * BOARD_SIZE, FEATURES),
-            nn.ReLU(),
-            nn.Linear(FEATURES, BOARD_SIZE * BOARD_SIZE * 2 + 1)  # Выдаем логиты для кросс-энтропии
+            nn.ReLU(inplace=True),
+            nn.Linear(FEATURES, BOARD_SIZE * BOARD_SIZE * 2 + 1)
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Прямой проход через сеть.
-
-        Args:
-            x (torch.Tensor): Входной тензор состояния доски (batch, 33, BOARD_SIZE, BOARD_SIZE).
-
-        Returns:
-            policy_logits (torch.Tensor): Логиты вероятностей ходов (batch, BOARD_SIZE*BOARD_SIZE*2 + 1).
-            value (torch.Tensor): Оценка позиции (batch, 1).
-            territory (torch.Tensor): Предсказание принадлежности клеток (batch, 1, BOARD_SIZE, BOARD_SIZE).
-            score_logits (torch.Tensor): Логиты распределения финального счета (batch, BOARD_SIZE*2 + 1).
-        """
-        # Пропускаем через общий ствол
         x = self.conv_in(x)
-        for block in self.res_blocks:
-            x = block(x)
+        x = self.res_blocks(x)  # Заменили цикл на вызов Sequential
 
-        # Получаем выходы от всех четырех голов
         policy_logits = self.policy_head(x)
         value = self.value_head(x)
         territory = self.territory_head(x)
         score_logits = self.score_head(x)
 
-        # Возвращаем логиты (без Softmax), так как это стандарт для nn.CrossEntropyLoss
         return policy_logits, value, territory, score_logits

@@ -1,31 +1,34 @@
 import numpy as np
 import math
-from typing import List, Tuple, Union
+from typing import List, Tuple
 import torch
 
-from board import Board, Move, BOARD_SIZE, BLACK
-from game import Game, decode_move, encode_move
+from config import BOARD_SIZE, board_size_sqr, possible_moves_total, DEEP_DEPTH
+from move import decode_move
+from game import Game
 import time
 
 from noise import DirichletNoiseConfig
 from random_network import NetworkBase
 
-board_size_sqr = BOARD_SIZE * BOARD_SIZE
-possible_moves_total = board_size_sqr * 2 + 1
-
 import torch.nn.functional as F
 
+_SCORES_ARRAY = np.arange(-board_size_sqr, board_size_sqr + 1, dtype=np.float32)
+def get_expected_score(score_logits: np.ndarray) -> float:
+    """
+    Вычисляет математическое ожидание счета на чистом NumPy (zero-allocation для массива очков).
+    """
+    # 1. Стабильный Softmax на NumPy
+    # Вычитаем максимум для вычислительной стабильности (защита от переполнения exp)
+    shifted_logits = score_logits - np.max(score_logits)
+    exp_logits = np.exp(shifted_logits)
+    score_probs = exp_logits / np.sum(exp_logits)
 
-DEEP_DEPTH = 400
-SHALLOW_DEPTH = 50
+    # 2. Вычисление математического ожидания
+    # np.dot(a, b) работает быстрее, чем np.sum(a * b), и не выделяет память под промежуточный массив
+    expected_score = np.dot(score_probs, _SCORES_ARRAY)
 
-
-
-def get_expected_score(score_logits) -> float:
-    score_probs = F.softmax(score_logits, dim=0).squeeze()
-    scores = torch.arange(-board_size_sqr,  board_size_sqr + 1, device=score_logits.device, dtype=torch.float32)
-    expected_score = torch.sum(score_probs * scores).item()
-    return expected_score
+    return float(expected_score)
 
 
 def get_score_utility(expected_score: float, scale: float = 15, max_utility: float = 0.2) -> float:
@@ -207,10 +210,15 @@ class MCTS_Agent:
                     continue
                 self.recycle_branch(node)
 
-            self.root.reset()
-            self.node_pool.append(self.root)
+            old_root = self.root
+            self.root = new_root
 
-        self.root = new_root
+            self.root.parent = None
+            self.root.parent_action = None
+            self.root.prior_prob = 0.0
+
+            old_root.reset()
+            self.node_pool.append(old_root)
 
     def recycle_branch(self, node: MCTSNode):
         """Рекурсивно возвращает всё поддерево в пул."""
@@ -221,7 +229,7 @@ class MCTS_Agent:
         self.node_pool.append(node)
 
 
-    def search(self, root: MCTSNode = None, num_simulations: int = 1600) -> Tuple[Move, np.ndarray, MCTSNode]:
+    def search(self, root: MCTSNode = None, num_simulations: int = 1600) -> Tuple[int,int,int,int,bool, np.ndarray, MCTSNode]:
         """
         Запустить MCTS поиск для текущего состояния игры.
 
@@ -273,12 +281,12 @@ class MCTS_Agent:
             self._backpropagate(search_path, value)
 
         # Выбираем лучший ход на основе visit counts
-        best_move, policy_distribution, best_node = self._select_action()
+        x, y, life_cycle, color, is_pass, policy_distribution, best_node = self._select_action()
 
         elapsed_time = time.time() - start_time
         print(f"Время поиска лучшего хода search: {elapsed_time:.2f} сек")
 
-        return best_move, policy_distribution, best_node
+        return x, y, life_cycle, color, is_pass, policy_distribution, best_node
 
     def _select_child(self, node: MCTSNode) -> MCTSNode:
         """
@@ -306,18 +314,18 @@ class MCTS_Agent:
         # Если выбранный узел еще не создан - создаем его сейчас
         if best_action_idx not in node.children:
             # Декодируем действие
-            move = decode_move(best_action_idx, node.game_state.current_player)
+            x, y, life_cycle, color, is_pass = decode_move(best_action_idx, node.game_state.current_player)
 
             child_node = self.node_pool.pop()
 
-            success, future_game = node.game_state.is_valid_move(move, child_node.game_state)
+            success = node.game_state.is_valid_move(x, y, life_cycle, color, is_pass, child_node.game_state)
 
             if not success:
                 # Это не должно происходить, если child_priors правильно заполнен
-                raise ValueError(f"Invalid move selected: {move}")
+                raise ValueError(f"Invalid move selected: {x}:{y}{' GoL' if life_cycle == 1 else ''} Pass:{is_pass}")
 
             child_node.parent = node
-            child_node.parent_action = move
+            child_node.parent_action = (x, y, life_cycle, color, is_pass)
             child_node.prior_prob = node.child_priors[best_action_idx]
 
             node.children[best_action_idx] = child_node
@@ -432,7 +440,7 @@ class MCTS_Agent:
             node.total_value += value
             node.mean_value = node.total_value / node.visit_count
 
-    def _select_action(self) -> Tuple[Move, np.ndarray, MCTSNode]:
+    def _select_action(self) -> Tuple[int,int,int,int,bool, np.ndarray, MCTSNode]:
         """
         Выбрать финальное действие на основе visit counts корневых детей.
 
@@ -459,10 +467,10 @@ class MCTS_Agent:
         policy_distribution = visit_counts / np.sum(visit_counts) if np.sum(visit_counts) > 0 else visit_counts
 
         # Декодируем action в Move
-        best_move = decode_move(action_idx, self.root.game_state.current_player)
+        x, y, life_cycle, color, is_pass = decode_move(action_idx, self.root.game_state.current_player)
         best_node = self.root.children[action_idx]
 
-        return best_move, policy_distribution, best_node
+        return x, y, life_cycle, color, is_pass, policy_distribution, best_node
 
     def get_policy(self) -> np.ndarray:
         """

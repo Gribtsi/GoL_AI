@@ -4,7 +4,8 @@ from typing import Union
 import torch
 import torch.nn as nn
 
-from rl_agent import NUM_RES_BLOCKS
+# Подтягиваем конфигурацию, чтобы Manager знал, как инициализировать модель
+from config import NUM_RES_BLOCKS
 
 
 def init_weights(model: nn.Module):
@@ -39,7 +40,6 @@ class ModelManager:
             model_class: Класс вашей нейросети (например, RLAgent).
             save_dir: Директория для сохранения чекпоинтов.
             device: Устройство для вычислений.
-            **model_kwargs: Аргументы для конструктора модели (например, num_res_blocks=7).
         """
         self.model_class = model_class
         self.save_dir = save_dir
@@ -52,18 +52,16 @@ class ModelManager:
         """
         print("Creating a new model with random weights...")
         model = self.model_class().to(self.device)
-        init_weights(model)  # Применяем нашу функцию инициализации
+        init_weights(model)
+
+        # Сразу переводим в channels_last (полезно для MCTS/обучения)
+        model = model.to(memory_format=torch.channels_last)
         return model
 
-    def save_checkpoint(self, model: nn.Module, optimizer: Union[ torch.optim.Optimizer, None], metadata: dict, filename: str):
+    def save_checkpoint(self, model: nn.Module, optimizer: Union[torch.optim.Optimizer, None], metadata: dict,
+                        filename: str):
         """
         Сохраняет полный чекпоинт для возобновления обучения.
-
-        Args:
-            model: Экземпляр модели.
-            optimizer: Экземпляр оптимизатора.
-            metadata: Словарь с метаданными (например, {'games_played': 1000}).
-            filename: Имя файла (например, 'agent_v1_g1000.pth').
         """
         filepath = os.path.join(self.save_dir, filename)
         checkpoint = {
@@ -78,20 +76,13 @@ class ModelManager:
 
     def load_checkpoint(self, filename: str, model: nn.Module, optimizer: torch.optim.Optimizer = None):
         """
-        Загружает чекпоинт в существующие модель и оптимизатор.
-
-        Args:
-            filename: Имя файла для загрузки.
-            model: Экземпляр модели, куда будут загружены веса.
-            optimizer: (Опционально) Экземпляр оптимизатора.
-
-        Returns:
-            metadata: Загруженные метаданные.
+        Загружает чекпоинт в существующие модель и оптимизатор (для дообучения).
         """
         filepath = os.path.join(self.save_dir, filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
 
+        # map_location гарантирует, что тензоры загрузятся на нужный девайс
         checkpoint = torch.load(filepath, map_location=self.device)
 
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -104,25 +95,40 @@ class ModelManager:
 
     def load_model_weights(self, filename: str) -> nn.Module:
         """
-        Создает новую модель и загружает в нее только веса (для инференса).
+        Создает новую модель и загружает в нее только веса (для инференса/MCTS).
         """
         filepath = os.path.join(self.save_dir, filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
 
-        model = self.model_class().to(self.device)
+        # Создаем пустую модель и переносим на девайс в нужном формате
+        model = self.model_class().to(self.device, memory_format=torch.channels_last)
+
+        # Загружаем чекпоинт
         checkpoint = torch.load(filepath, map_location=self.device)
         model.load_state_dict(checkpoint['model_state_dict'])
+
+        # ВАЖНО: Для инференса MCTS обязательно нужно перевести модель в eval().
+        # Иначе BatchNorm будет менять свою статистику при каждом вызове предсказания,
+        # что полностью сломает предсказания агента!
+        model.eval()
+
         print(f"Model weights loaded from {filepath}")
         return model
 
 
-def create_new_model(model_manager: ModelManager, name: str = "agent_v0"):
-    current_best_model_id = name
-    challenger_model = model_manager.create_new_model()  # create_new_model уже вызывает init_weights
+def create_new_model(model_manager: ModelManager, name: str = "agent_v0.pth"):
+    # Вызов создает модель уже на нужном device и применяет инициализацию
+    challenger_model = model_manager.create_new_model()
 
     # Сохраняем чекпоинт с метаданными (пока без оптимизатора)
     initial_metadata = {'games_played': 0, 'version': 0}
-    model_manager.save_checkpoint(challenger_model, None, initial_metadata, f"{name}")
+
+    # Рекомендуется использовать расширение .pth или .pt для файлов чекпоинтов
+    if not name.endswith('.pth') and not name.endswith('.pt'):
+        name += '.pth'
+
+    model_manager.save_checkpoint(challenger_model, None, initial_metadata, name)
 
     print(f"Начальная модель '{name}' создана и сохранена.")
+    return challenger_model

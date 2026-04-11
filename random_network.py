@@ -1,18 +1,12 @@
 import abc
-from abc import abstractclassmethod
-from math import gamma
 
 from numpy.random import random, uniform
-from scipy.signal import ellip
 from torch.distributions import Dirichlet
-from torch.nn.parallel.scatter_gather import scatter_kwargs
-
-import board
-from game import Game, decode_move, board_size_sqr
 
 import numpy as np
 
-from board import BOARD_SIZE, BLACK, Board, WHITE
+from board import Board
+from config import BOARD_SIZE, BLACK, WHITE, board_size_sqr, IN_CHANNELS
 
 
 class NetworkBase:
@@ -87,6 +81,7 @@ import torch
 import torch.nn.functional as F
 from rl_agent import RLAgent
 
+
 class PytorchAgentWrapper(NetworkBase):
     """
     Обертка для PyTorch-модели RLAgent, предоставляющая интерфейс,
@@ -96,53 +91,57 @@ class PytorchAgentWrapper(NetworkBase):
     def __init__(self, model: torch.nn.Module, device: str = 'cpu'):
         """
         Инициализация обертки.
-
-        Args:
-            model (torch.nn.Module): Экземпляр обученной модели (RLAgent).
-            device (str): Устройство для вычислений ('cpu' или 'cuda').
         """
-        self.model = model.to(device)
         self.device = device
 
-        # Переключаем модель в режим оценки. Это важно, так как отключает
-        # слои вроде Dropout и меняет поведение BatchNorm.
+        # 1. Гарантируем, что модель в channels_last
+        self.model = model.to(device, memory_format=torch.channels_last)
         self.model.eval()
+
+        # 2. Компиляция графа (PyTorch 2.0+). mode="reduce-overhead" идеально для MCTS,
+        # так как минимизирует задержки вызова на маленьких батчах.
+        if hasattr(torch, 'compile') and device == 'cuda':
+            self.model = torch.compile(self.model)
+
+        # 3. ZERO-ALLOCATION НА GPU:
+        # Вместо того чтобы каждый раз создавать тензор через .to(device),
+        # мы один раз выделяем память под него в правильном формате.
+        self.gpu_buffer = torch.empty(
+            (1, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            dtype=torch.float32,
+            device=self.device,
+            memory_format=torch.channels_last
+        )
 
     def predict(self, state_numpy: np.ndarray, **kwargs) -> (np.ndarray, np.float32, np.ndarray):
         """
         Делает предсказание с помощью нейросети.
-
-        Args:
-            state_numpy (np.ndarray): Входной тензор состояния игры
-                                      в формате PyTorch (17, 19, 19).
-
-        Returns:
-            (policy, value):
-                - policy (np.ndarray): Массив вероятностей ходов (723,).
-                - value (np.float32): Оценка позиции от -1 до 1.
         """
-        # 1. Преобразование numpy-массива в тензор PyTorch
-        #    - Добавляем batch-измерение: (17, 19, 19) -> (1, 17, 19, 19)
-        #    - Устанавливаем тип данных float32
-        #    - Перемещаем на нужное устройство
-        input_tensor = torch.from_numpy(state_numpy).unsqueeze(0).to(self.device, dtype=torch.float32)
+        # 1. Zero-allocation копирование.
+        # torch.from_numpy не выделяет память (это view),
+        # а .copy_() просто переливает биты в уже существующий GPU-буфер.
+        state_view = torch.from_numpy(state_numpy).unsqueeze(0)
+        self.gpu_buffer.copy_(state_view, non_blocking=True)
 
-        # 2. Выполнение предсказания
-        #    Используем torch.no_grad() для отключения расчета градиентов,
-        #    что ускоряет вычисления и экономит память.
-        with torch.no_grad():
-            policy_logits, value_tensor, _, score_logits = self.model(input_tensor)
+        # 2. inference_mode() - это более строгая и быстрая версия no_grad()
+        with torch.inference_mode():
+            # enabled=(self.device=='cuda') защитит от падений, если запустишь на CPU
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
+                policy_logits, value_tensor, _, score_logits = self.model(self.gpu_buffer)
 
         # 3. Обработка результатов
-        #    - Преобразуем логиты в вероятности с помощью softmax
-        #    - Убираем batch-измерение с помощью squeeze(0)
-        #    - Перемещаем на CPU и конвертируем в numpy
-        policy_probabilities = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
+        # Обязательно кастуем к float32 перед softmax, иначе в fp16 возможны underflow/overflow
+        policy_probabilities = F.softmax(policy_logits.to(torch.float32), dim=1)
+        policy_probabilities = policy_probabilities.squeeze(0).cpu().numpy()
 
-        # Извлекаем скалярное значение из тензора оценки
         value_scalar = value_tensor.item()
 
-        return policy_probabilities, np.float32(value_scalar), score_logits
+        # 4. ИСПРАВЛЕНИЕ УТЕЧКИ: score_logits нужно перенести на CPU и в numpy!
+        # В старом коде он возвращался как GPU-тензор, из-за чего MCTS узлы
+        # могли вечно хранить ссылки на VRAM.
+        score_numpy = score_logits.squeeze(0).cpu().numpy()
+
+        return policy_probabilities, np.float32(value_scalar), score_numpy
 
 
 def create_and_get_model():

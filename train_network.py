@@ -2,7 +2,7 @@
 import torch.nn.functional as F
 import numpy as np
 
-from board import BOARD_SIZE
+from config import BOARD_SIZE
 
 import h5py
 import torch

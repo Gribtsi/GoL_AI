@@ -1,58 +1,12 @@
-import time
-
 import numpy as np
-from collections import deque
-from typing import Tuple, Union
 
-from board import Board, Move, WHITE, BLACK, BOARD_SIZE, EMPTY, position_permissions_numba, MAX_KOMI, board_size_sqr, \
-    possible_moves_total, get_opponent, STATES_TO_NN, get_legal_moves_mask_numba, symbols
+from board import Board, get_opponent
+from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols
+from move import encode_move
 
 
 # Предполагается, что у вас уже есть njit-версии этих функций
 # find_group_and_liberties, check_captures, remove_captured_stones, apply_game_of_life
-
-
-def decode_move(action_idx: int, color: int) -> Move:
-    """
-    Декодировать индекс действия в объект Move.
-
-    Args:
-        action_idx: Индекс от 0 до 722
-        color: Цвет текущего игрока
-
-    Returns:
-        Объект Move
-    """
-    if action_idx == board_size_sqr * 2:
-        # Пас
-        return Move(None, 0, color, True)
-    else:
-        # Обычный ход
-        position_idx = action_idx % board_size_sqr
-        life_cycle = action_idx // board_size_sqr
-
-        x = position_idx // BOARD_SIZE
-        y = position_idx % BOARD_SIZE
-
-        return Move((x, y), life_cycle, color)
-
-def encode_move(move: Move) -> int:
-    """
-    Кодировать Move в индекс действия.
-
-    Args:
-        move: Объект Move
-
-    Returns:
-        Индекс действия (0-722)
-    """
-    if move.is_pass():
-        return BOARD_SIZE * BOARD_SIZE * 2
-    else:
-        x, y = move.position
-        position_idx = x * BOARD_SIZE + y
-        return position_idx + move.life_cycles * BOARD_SIZE * BOARD_SIZE
-
 
 
 class Game:
@@ -96,6 +50,10 @@ class Game:
         self.max_moves = max_moves
         self.current_move = 0
 
+    def set_komi(self, komi: float):
+        self.komi = komi
+        self.komi_norm = self.komi / MAX_KOMI
+
     def clear(self):
         self.winner = EMPTY
 
@@ -116,7 +74,7 @@ class Game:
             self.has_mask = True
         return self.legal_mask
 
-    def is_valid_move(self, move: Move, out_game: 'Game') -> bool:
+    def is_valid_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, out_game: 'Game') -> bool:
         """
         Проверить легальность хода с учетом правил игры.
 
@@ -128,17 +86,19 @@ class Game:
         """
 
         # Проверка 1: Цвет хода должен совпадать с текущим игроком
-        if move.color != self.current_player:
+        if color != self.current_player:
             return False
 
         # Проверка 2: По маске пробить
-        if self.get_legal_moves_mask()[encode_move(move)] == 0:
+        if self.get_legal_moves_mask()[encode_move(x, y, life_cycles, color, is_pass)] == 0:
             return False
 
         self.copy(out_game)
-        out_game.board.make_move(move, True)
+        out_game.board.make_move(x, y, life_cycles, color, is_pass, True)
 
-        if move.is_pass():
+        out_game.has_mask = False
+
+        if is_pass:
             out_game.consecutive_passes += 1
         else:
             out_game.consecutive_passes = 0
@@ -189,8 +149,12 @@ class Game:
         base_score = self.board.get_score()
 
         # Добавляем коми
-        black_total = base_score['black'] - self.komi
-        white_total = base_score['white'] + self.komi
+
+        komi_black = self.komi if self.komi < 0 else 0
+        komi_white = self.komi if self.komi > 0 else 0
+
+        black_total = base_score['black'] +  komi_black
+        white_total = base_score['white'] + komi_white
 
         # Определяем победителя
         if black_total > white_total:
@@ -212,8 +176,8 @@ class Game:
             'black_base': base_score['black'],
             'white_base': base_score['white'],
 
-            'black_komi': -self.komi,
-            'white_komi': self.komi,
+            'black_komi': komi_black,
+            'white_komi': komi_white,
             'max_komi': MAX_KOMI,
 
             'black': black_total,
@@ -321,6 +285,12 @@ class Game:
 
         target.game_over = self.game_over
         target.winner = self.winner
+
+        target.has_mask = self.has_mask
+        np.copyto(target.legal_mask, self.legal_mask)
+
+        target.komi = self.komi
+        target.komi_norm = self.komi_norm
 
     def __repr__(self) -> str:
         """Строковое представление игры."""
