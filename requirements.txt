@@ -1,0 +1,6 @@
+numpy
+h5py
+pyzmq
+msgpack-numpy
+msgpack
+numba

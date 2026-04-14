@@ -1,0 +1,25 @@
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Данные и модели (они пробрасываются через volumes)
+shared_data/
+shared_models/
+*.h5
+*.pth
+
+# Кэш питона и IDE
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+test/
+test1/
+
+# Git
+.git/
+.gitignore
+
+.ipynb_checkpoints/

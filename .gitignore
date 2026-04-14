@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 
 test*
+shared*
+triton_cache/
 
 # C extensions
 *.so

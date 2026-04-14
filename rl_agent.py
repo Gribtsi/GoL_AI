@@ -10,7 +10,6 @@ class ResBlock(nn.Module):
     """
     def __init__(self, num_channels):
         super(ResBlock, self).__init__()
-        # ОПТИМИЗАЦИЯ 1: bias=False
         self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(num_channels)
         self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1, bias=False)
@@ -18,11 +17,9 @@ class ResBlock(nn.Module):
 
     def forward(self, x):
         residual = x
-        # ОПТИМИЗАЦИЯ 2: inplace=True
         out = F.relu(self.bn1(self.conv1(x)), inplace=True)
         out = self.bn2(self.conv2(out))
         out += residual
-        # inplace=True здесь тоже экономит выделение памяти
         out = F.relu(out, inplace=True)
         return out
 

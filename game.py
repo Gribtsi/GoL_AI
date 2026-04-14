@@ -1,12 +1,25 @@
+from typing import Tuple, Union
+
 import numpy as np
 
-from board import Board, get_opponent
-from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols
+from board import Board, get_opponent, DeltaBoard
+from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME
 from move import encode_move
 
 
 # Предполагается, что у вас уже есть njit-версии этих функций
 # find_group_and_liberties, check_captures, remove_captured_stones, apply_game_of_life
+
+class DeltaGame:
+    def __init__(self):
+        self.next_mask =  np.zeros(possible_moves_total, dtype=np.float32)
+        self.delta_board = DeltaBoard()
+
+        self.is_pass = 0
+
+        self.valid = False
+
+
 
 
 class Game:
@@ -22,7 +35,7 @@ class Game:
     - Подсчет очков с учетом коми
     """
 
-    def __init__(self, komi: float = 0, max_moves : int = 100):
+    def __init__(self, komi: float = 0, max_moves : int = MAX_MOVES_PER_GAME):
         """
         Инициализация новой игры.
 
@@ -40,8 +53,9 @@ class Game:
 
         self.current_player = BLACK  # Черные ходят первыми
 
-        self.consecutive_passes = 0  # Счетчик последовательных пасов
         self.game_over = False
+
+        self.pass_history = np.zeros(MAX_MOVES_PER_GAME, dtype=np.bool_)
 
         # Коми в пользу БЕЛЫХ
         self.komi = komi
@@ -49,6 +63,56 @@ class Game:
 
         self.max_moves = max_moves
         self.current_move = 0
+
+    def get_consequtive_passes(self):
+        move = self.current_move
+
+        passes = 0
+
+        while move > 0 and self.pass_history[move - 1]:
+            passes += 1
+            move -= 1
+        return passes
+
+
+    def undo(self):
+
+        if self.current_move <= 0:
+
+            raise Exception("Trying to undo empty game!")
+
+        last_pass = self.current_move > 0 and self.pass_history[self.current_move - 1]
+
+        if not last_pass:
+            self.board.undo()
+
+        self.current_player = get_opponent(self.current_player)
+        self.has_mask = False
+
+        self.game_over = False
+
+        self.current_move -= 1
+
+    def apply_delta(self, delta_game: DeltaGame):
+
+        if not delta_game.valid:
+            return
+
+        self.board.apply_delta(delta_game.delta_board)
+
+        np.copyto(self.legal_mask, delta_game.next_mask)
+        self.has_mask = True
+
+        self.current_player = get_opponent(self.current_player)
+
+        self.pass_history[self.current_move] = delta_game.is_pass
+
+        self.current_move += 1
+
+        if self.get_consequtive_passes() >= 2:
+            self.game_over = True
+        if self.current_move >= self.max_moves:
+            self.game_over = True
 
     def set_komi(self, komi: float):
         self.komi = komi
@@ -62,19 +126,22 @@ class Game:
 
         self.current_player = BLACK
 
-        self.consecutive_passes = 0
+        self.pass_history.fill(0)
+
         self.game_over =False
 
         self.current_move = 0
-
 
     def get_legal_moves_mask(self) -> np.ndarray:
         if not self.has_mask:
             self.board.get_legal_moves_mask(self.current_player, self.legal_mask)
             self.has_mask = True
+
         return self.legal_mask
 
-    def is_valid_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, out_game: 'Game') -> bool:
+
+
+    def is_valid_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, out_game: 'Game', out_delta: DeltaGame) -> bool:
         """
         Проверить легальность хода с учетом правил игры.
 
@@ -94,22 +161,46 @@ class Game:
             return False
 
         self.copy(out_game)
-        out_game.board.make_move(x, y, life_cycles, color, is_pass, True)
 
-        out_game.has_mask = False
+        out_game.make_move(x,y,life_cycles,is_pass, out_delta)
+
+
+        return True
+
+    def make_move(self, pos_x, pos_y, life_cycles, is_pass, out: DeltaGame, validate = True) -> bool:
+
+        if validate and self.get_legal_moves_mask()[encode_move(pos_x, pos_y, life_cycles, self.current_player, is_pass)] == 0:
+            out.valid = False
+            return False
+
+
+
+
+        self.board.make_move(pos_x, pos_y, life_cycles, self.current_player, is_pass, out.delta_board)
+
+
 
         if is_pass:
-            out_game.consecutive_passes += 1
+            out.is_pass = 1
         else:
-            out_game.consecutive_passes = 0
-        out_game.current_move += 1
+            out.is_pass = 0
 
-        if out_game.consecutive_passes >= 2:
-            out_game.game_over = True
+        self.pass_history[self.current_move] = is_pass
 
-        out_game.current_player = get_opponent(self.current_player)
+        self.current_move += 1
 
-        # Пытаемся применить ход на тестовой доске
+        if self.get_consequtive_passes() >= 2:
+            self.game_over = True
+        if self.current_move >= self.max_moves:
+            self.game_over = True
+
+        self.current_player = get_opponent(self.current_player)
+
+        self.has_mask = False
+        np.copyto(out.next_mask, self.get_legal_moves_mask())
+
+        out.valid = True
+
         return True
 
     def get_komi_for_current_player(self):
@@ -243,15 +334,36 @@ class Game:
 
         return "\n".join(lines)
 
+    def get_board_text(self):
+        return self.board.board_with_permissions_as_text(self.current_player, self.get_legal_moves_mask())
+
     def print_score(self):
         """Вывести результаты подсчета очков с учетом коми."""
         print(self.get_score_text())
 
     def get_current_leader(self):
-        score = self.get_score()
-        return score['winner']
+        return self.get_winner()
+
+    def get_winner_and_margin_fast(self) -> Tuple[int,int]:
+        black, white = self.board.fast_territories()
+
+        if black > white + self.komi:
+            self.winner = BLACK
+            margin = black - white
+        elif black < white + self.komi:
+            self.winner  = WHITE
+            margin = white - black
+        else:
+            self.winner = EMPTY
+            margin = 0
+
+        return self.winner, margin
+
+
+
 
     def get_winner(self):
+        self.get_winner_and_margin_fast()
         return self.winner
 
     def clone(self) -> 'Game':
@@ -266,7 +378,8 @@ class Game:
         new_game.board = self.board.clone()
 
         new_game.current_player = self.current_player
-        new_game.consecutive_passes = self.consecutive_passes
+
+        np.copyto(new_game.pass_history, self.pass_history)
 
         new_game.current_move += self.current_move
 
@@ -279,7 +392,6 @@ class Game:
         self.board.copy(target.board)
 
         target.current_player = self.current_player
-        target.consecutive_passes = self.consecutive_passes
 
         target.current_move = self.current_move
 
@@ -291,6 +403,8 @@ class Game:
 
         target.komi = self.komi
         target.komi_norm = self.komi_norm
+
+        np.copyto(target.pass_history, self.pass_history)
 
     def __repr__(self) -> str:
         """Строковое представление игры."""

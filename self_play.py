@@ -1,22 +1,33 @@
 
 import time
+from datetime import datetime
 from typing import Tuple
 
 from IPython.display import clear_output
 from numpy.random import uniform
-from win32ctypes.pywin32.pywintypes import datetime
 
 from game import Game
+from game_data_sender import GameDataSender
 from mcts_agent import MCTS_Agent
 from move import move_to_dict
 from config import EMPTY, DEEP_DEPTH, SHALLOW_DEPTH, UNTIL_THE_END_CHANCE, CONCEDE_AT, \
-    DEEP_SEARCH_CHANCE
+    DEEP_SEARCH_CHANCE, BOARD_SIZE, possible_moves_total, IN_CHANNELS
 import numpy as np
 import json
 import h5py
 import uuid
 
 from random_komi import generate_komi
+
+def generate_name():
+    big_number = 4000000000
+
+    #Чтобы в алфавитной сортировке новее было выше
+    reversed_time = int(big_number - time.time())
+
+    game_id = f"game_{reversed_time}_{datetime.now()}_{uuid.uuid4().hex[:8]}"
+
+    return game_id
 
 
 def process_game_history(history: list, final_board_state: np.ndarray, score: dict) -> dict:
@@ -75,7 +86,7 @@ def process_game_history(history: list, final_board_state: np.ndarray, score: di
         territories_list.append(territories)
 
         # 4. Обработка метаданных (конвертация словаря в строку для HDF5)
-        move_dict = move_to_dict(*turn_data['move'])
+        move_dict = turn_data['move']
         moves_meta.append(json.dumps(move_dict).encode('utf-8'))
 
     # Возвращаем "колонки" данных
@@ -96,34 +107,63 @@ def save_game_to_hdf5(h5_file_path: str, game_data: dict, game_id: str = None):
     Сохраняет обработанную партию в HDF5 базу данных.
     """
     if game_id is None:
-        game_id = f"game_{uuid.uuid4().hex}"
+        game_id = generate_name()
 
-    with h5py.File(h5_file_path, 'a') as f:
-        # Создаем директорию (группу) для конкретной партии
-        game_group = f.create_group(game_id)
+    with h5py.File(h5_file_path, 'a', libver=('v110','latest')) as f:
+        if 'state_tensor' not in f:
+            # Задаем maxshape=(None, ...) чтобы они могли расти бесконечно.
+            # chunks обязательно нужно настроить (здесь для примера беру (128, ...))
+            f.create_dataset('state_tensor', shape=(0, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), maxshape=(None, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), chunks=(4, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE),
+                             dtype='float32', compression='lzf')
+            f.create_dataset('mcts_policy', shape=(0, possible_moves_total), maxshape=(None, possible_moves_total), chunks=(32, possible_moves_total), dtype='float32',
+                             compression='lzf')
+            f.create_dataset('territories', shape=(0, BOARD_SIZE, BOARD_SIZE), maxshape=(None, BOARD_SIZE, BOARD_SIZE), chunks=(64, BOARD_SIZE, BOARD_SIZE),
+                             dtype='int8', compression='lzf')
+            f.create_dataset('value', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='float32')
+            f.create_dataset('score', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int64')
+            f.create_dataset('turn', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int32')
+            f.create_dataset('move_meta', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='S32')
+            f.create_dataset('game_id', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='S32')
 
-        # Основные тензоры для обучения (используем компрессию для экономии места)
-        game_group.create_dataset('state_tensor', data=game_data['state_tensor'], compression='lzf')
-        game_group.create_dataset('mcts_policy', data=game_data['mcts_policy'], compression='lzf')
-        game_group.create_dataset('territories', data=game_data['territories'], compression='lzf')
+        d_state = f['state_tensor']
+        d_policy = f['mcts_policy']
+        d_terr = f['territories']
+        d_value = f['value']
+        d_score = f['score']
+        d_turn = f['turn']
+        d_meta = f['move_meta']
+        d_gameid = f['game_id']
 
-        # Скалярные значения и таргеты
-        game_group.create_dataset('value', data=game_data['value'])
-        game_group.create_dataset('score', data=game_data['score'])
+        total_samples = d_state.shape[0]
 
-        # Метаданные (переменная длина строк, поэтому указываем спец. формат h5py)
-        game_group.create_dataset('turn', data=game_data['turn'])
-        game_group.create_dataset('move_meta', data=game_data['move_meta'])
+        added_samples = len(game_data['turn'])
 
-        # Если есть общая метадата для всей игры (не по ходам), сохраняем в атрибуты группы:
-        #game_group.attrs['board_size'] = metadata['board_size']
-        #game_group.attrs['komi'] = metadata['komi']
-        #game_group.attrs['max_komi'] = metadata['max_komi']
+        if added_samples == 0:
+            return
+
+        new_total = total_samples + added_samples
+
+        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
+            dset.resize((new_total,) + dset.shape[1:])
+
+        d_state[total_samples:new_total] = game_data['state_tensor']
+        d_policy[total_samples:new_total] = game_data['mcts_policy']
+        d_terr[total_samples:new_total] = game_data['territories']
+        d_value[total_samples:new_total] = game_data['value']
+        d_score[total_samples:new_total] = game_data['score']
+        d_turn[total_samples:new_total] = game_data['turn']
+        d_meta[total_samples:new_total] = np.array(game_data['move_meta']).astype('S32')
+
+        d_gameid[total_samples:new_total] = np.array([game_id] * added_samples).astype('S32')
+
+        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
+            dset.flush()
+
 
 
 def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, extra_text : str = None) -> Tuple[list, Game]:
 
-    game = agent.root.game_state
+    game : Game = agent.game_state
 
     komi, flat_komi = generate_komi()
 
@@ -177,7 +217,7 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
             'deep_search': is_deep
         })
 
-        game = best_node.game_state
+        game.apply_delta(best_node.delta_game)
 
         if not till_the_end:
             if (best_node.mean_value > CONCEDE_AT) and (
@@ -200,19 +240,19 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
 
     return history, game
 
+
 def generate_self_play_games(
-        games_to_generate: int, games_batch: int,
+        games_to_generate: int,
         rl_agent: MCTS_Agent, max_moves: int,
-        file_path: str):
+        file_path: str, log: bool):
 
     start_time = time.time()
-    for k in range(int(games_to_generate / games_batch) if games_batch < games_to_generate else 1):
 
-        for i in range(games_batch if games_batch < games_to_generate else games_to_generate):
+    for index in range(games_to_generate):
 
-            text = f"ИГРА {i + 1 + k * games_batch}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
+            text = f"ИГРА {index + 1}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
 
-            history, game = self_play(agent=rl_agent, max_moves=max_moves, extra_text=text)
+            history, game = self_play(agent=rl_agent, max_moves=max_moves, extra_text=text, visualise=log)
 
             game_data = process_game_history(
                 history=history,
@@ -220,8 +260,10 @@ def generate_self_play_games(
                 score=game.get_score(),
             )
 
-            game_id = f"game_{i:05d}_{datetime.now()}_{uuid.uuid4().hex[:8]}"
-
-            save_game_to_hdf5(file_path, game_data, game_id=game_id)
+            samples = len(game_data['turn'])
+            if samples > 0:
+                save_game_to_hdf5(file_path, game_data, generate_name())
 
             rl_agent.flush()
+
+

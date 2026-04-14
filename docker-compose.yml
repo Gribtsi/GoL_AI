@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  data_writer:
+    build: .
+    command: python game_data_writer_service.py
+    volumes:
+      - ./shared_data:/data   # Сохраняем HDF5 на хост-машину
+    networks:
+      - mcts_net
+
+  model_provider:
+    build: .
+    command: python model_provider_service.py
+    volumes:
+      - ./shared_models:/models # Сохраняем веса на хост-машину
+    networks:
+      - mcts_net
+
+  trainer:
+    build: .
+    command: python training_service.py
+    volumes:
+      - ./shared_data:/data
+      - ./shared_models:/models
+    depends_on:
+      - data_writer
+      - model_provider
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - mcts_net
+
+  inference_server:
+    build: .
+    command: python inference_service.py # Замените на имя файла, где лежит ZMQInferenceServer
+    environment:
+      - TORCHINDUCTOR_CACHE_DIR=/tmp/triton_cache # Кэш для torch.compile нужен только здесь (и в трейнере)
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./triton_cache:/tmp/triton_cache
+    depends_on:
+      - model_provider
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - mcts_net
+
+  worker:
+    build: .
+    command: python self_play_service.py --writer tcp://data_writer:5555 --provider tcp://model_provider:5556
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - VECLIB_MAXIMUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+    depends_on:
+      - data_writer
+      - model_provider
+    networks:
+      - mcts_net
+
+networks:
+  mcts_net:
+    driver: bridge
