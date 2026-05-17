@@ -1,4 +1,5 @@
 from typing import Tuple, Union
+import gc
 
 import zmq
 import pickle
@@ -6,9 +7,12 @@ import time
 import numpy as np
 import os
 import tempfile
+import multiprocessing as mp
+import torch
 
-from addresses_config import INFERENCE_SERVICE_ADDRESS, MODEL_PROVIDER_ADDRESS
-from config import INFERENCE_TIMEOUT_MS, DEEP_DEPTH, SHALLOW_DEPTH, DEEP_SEARCH_CHANCE, MAX_MOVES_PER_GAME
+from addresses_config import MODEL_PROVIDER_ADDRESS, get_inference_service_address
+from config import INFERENCE_TIMEOUT_MS, DEEP_DEPTH, SHALLOW_DEPTH, DEEP_SEARCH_CHANCE, MAX_MOVES_PER_GAME, \
+    INFERENCE_SERVICES_COUNT, NN_BATCH_SIZE
 from model_manager import ModelManager
 from random_network import BatchedPytorchAgentWrapper
 from rl_agent import RLAgent
@@ -84,33 +88,24 @@ class ModelClient:
         return model_name, True
 
 class ZMQInferenceServer:
-    def __init__(self, timeout_ms=INFERENCE_TIMEOUT_MS, device = 'cuda'):
+    def __init__(self, timeout_ms=INFERENCE_TIMEOUT_MS, process_id = 0, device = 'cuda'):
 
+        self.process_id = process_id
+        self.device = device
+        self.timeout_ms = timeout_ms
+        self.max_batch_size = NN_BATCH_SIZE
 
-        self.check_for_updates_interval = 60
+        self.check_for_updates_interval = 10
         self.last_update_time = 0
 
         self.current_model_version = None
-
-        temp_dir = tempfile.gettempdir()
-        self.model_client = ModelClient(save_dir=temp_dir)
-
-        self.device = device
-
-
-        self.model_manager = ModelManager(RLAgent, save_dir=temp_dir, device=device)
-
+        self.model_client = None
+        self.model_manager = None
         self.model = None
 
-        self.max_batch_size = -1
-        self.timeout_ms = timeout_ms
-
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.ROUTER)
-        self.socket.bind(INFERENCE_SERVICE_ADDRESS)
-
-        self.poller = zmq.Poller()
-        self.poller.register(self.socket, zmq.POLLIN)
+        self.context = None
+        self.socket = None
+        self.poller = None
 
     def check_for_updates(self) -> bool:
         new_version, is_updated = self.model_client.get_latest_model(self.current_model_version)
@@ -121,6 +116,11 @@ class ZMQInferenceServer:
             print(f"=== Инициализация агента {new_version} ===")
             best_model = self.model_manager.load_model_weights(new_version)
 
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+                torch.compiler.reset()
+            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+                torch._dynamo.reset()
+
             self.model = BatchedPytorchAgentWrapper(best_model, device=self.device)
             self.max_batch_size = self.model.max_batch_size
 
@@ -130,16 +130,55 @@ class ZMQInferenceServer:
             return True
         return False
 
+    def real_init(self):
+        self.check_for_updates_interval = 10
+        self.last_update_time = 0
 
+        self.current_model_version = None
+
+        temp_dir = tempfile.gettempdir()
+        process_model_dir = os.path.join(temp_dir, f"inference_models_p{self.process_id}")
+        os.makedirs(process_model_dir, exist_ok=True)
+
+        self.model_client = ModelClient(save_dir=process_model_dir)
+        self.model_manager = ModelManager(RLAgent, save_dir=process_model_dir, device=self.device)
+
+
+        cache_root = tempfile.gettempdir()
+        os.environ["TRITON_CACHE_DIR"] = f"{cache_root}/triton_cache/p{self.process_id}"
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{cache_root}/torchinductor_cache/p{self.process_id}"
+
+        os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+        os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
+
+
+        self.model = None
+
+
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.ROUTER)
+
+        self.socket.bind(get_inference_service_address(self.process_id))
+
+        self.poller = zmq.Poller()
+        self.poller.register(self.socket, zmq.POLLIN)
 
     def run(self):
-        print(f"Inference server listening on {INFERENCE_SERVICE_ADDRESS}... Max batch: {self.max_batch_size}")
+
+        gc.enable()
+
+        self.real_init()
+
+        # Сюда нормальный адрес
+        print(f"Inference server listening on {get_inference_service_address(self.process_id)}... Max batch: {self.max_batch_size}")
 
         while self.current_model_version is None:
             self.check_for_updates()
             if self.current_model_version is None:
                 print("Модель еще не готова, ждем 5 секунд...")
                 time.sleep(5)
+
+        print(f"Получена модель {self.current_model_version}")
 
         while True:
             identities = []
@@ -183,7 +222,7 @@ class ZMQInferenceServer:
             for i in range(actual_batch_size):
                 # Приводим к форматам, которые ожидает клиент (MCTS)
                 # policy_probabilities[i] уже np.ndarray, score_numpy тоже.
-                result = (policies[i], np.float32(values[i]), scores[i])
+                result = (policies[i], np.float32(values[i]), scores[i], self.current_model_version)
                 reply_payload = pickle.dumps(result)
 
                 self.socket.send_multipart([identities[i], empty_frames[i], reply_payload])
@@ -195,5 +234,17 @@ class ZMQInferenceServer:
 
 
 if __name__ == "__main__":
-    service = ZMQInferenceServer()
-    service.run()
+    mp.set_start_method('fork')
+    gc.freeze()
+
+
+    processes = []
+    for i in range(INFERENCE_SERVICES_COUNT):
+        service = ZMQInferenceServer(process_id=i)
+        p = mp.Process(target=service.run)
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+

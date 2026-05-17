@@ -3,27 +3,12 @@ import numpy as np
 from numba import njit
 
 from config import BOARD_SIZE, board_size_sqr, EMPTY, BLACK, WHITE, NN_HISTORY, MAX_HISTORY, STATES_TO_NN, IN_CHANNELS, \
-    symbols
-
-
-# --- Константы и вспомогательные функции, также помеченные @njit ---
-
-"""
-Легенда:
-- ⬜ = пустая ячейка
-- ⚫ = черный камень
-- 🔴 = белый камень
-- ❎ = можно поставить камень, но не провести цикл жизни
-- 🟩 = можно установить камень и затем провести цикл жизни
-"""
-
+    symbols, possible_moves_total
 
 @njit
 def is_valid_position(x: int, y: int) -> bool:
     """Проверяет, находится ли позиция в пределах доски."""
     return 0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE
-
-# --- Основные оптимизированные функции ---
 
 @njit
 def find_group_and_liberties(x: int, y: int, state: np.ndarray, group_array: np.ndarray, visited: np.ndarray) -> Tuple[int, int]:
@@ -44,12 +29,16 @@ def find_group_and_liberties(x: int, y: int, state: np.ndarray, group_array: np.
     #group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
 
     color = state[x, y]
-    if color == EMPTY:
+    if (color == EMPTY) or ((visited[x,y] & 1) == 1):
         return 0, 0
+
+    for tx in range(BOARD_SIZE):
+        for ty in range(BOARD_SIZE):
+            visited[tx,ty] &= ~2
 
     group_array.fill(0)
 
-    visited[x, y] = True
+    visited[x, y] |= 1
 
     # Первая точка группы
     group_array[0, 0] = x
@@ -73,21 +62,23 @@ def find_group_and_liberties(x: int, y: int, state: np.ndarray, group_array: np.
             ny = cy + dy[i]
 
             # Проверка границ доски
-            if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
-                if not visited[nx, ny]:
+            if (0 <= nx < BOARD_SIZE) and (0 <= ny < BOARD_SIZE):
+                if visited[nx, ny] == 0:
                     neighbor_color = state[nx, ny]
 
-                    if neighbor_color == EMPTY:
-                        # Нашли уникальное дыхание (свободную клетку)
-                        visited[nx, ny] = True
-                        liberties_count += 1
-
-                    elif neighbor_color == color:
+                    if neighbor_color == color:
                         # Нашли камень той же группы
-                        visited[nx, ny] = True
+                        visited[nx, ny] |= 1
                         group_array[tail, 0] = nx
                         group_array[tail, 1] = ny
                         tail += 1
+
+                    elif neighbor_color == EMPTY:
+                        # Нашли уникальное дыхание (свободную клетку)
+                        visited[nx, ny] |= 2
+                        liberties_count += 1
+
+
 
     # В group_array первые `tail` элементов — это координаты нашей группы
     # tail — это group_size
@@ -130,14 +121,9 @@ def check_captures_local(x: int, y: int, state: np.ndarray, marked_for_death : n
         if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
             neighbor_color = state[nx, ny]
             # Проверяем только камни противника, которые мы еще не проверяли
-            if neighbor_color != EMPTY and neighbor_color != played_color and not visited[nx, ny]:
+            if (neighbor_color != EMPTY) and (neighbor_color != played_color) and not ((visited[nx, ny] & 1) == 1):
 
                 size, liberties = find_group_and_liberties(nx, ny, state, group_array, visited)
-
-                # Помечаем всю группу противника как проверенную
-                for j in range(size):
-                    gx, gy = group_array[j, 0], group_array[j, 1]
-                    visited[gx, gy] = True
 
                 # Если у группы противника не осталось дыханий - она захвачена
                 if liberties == 0:
@@ -160,7 +146,7 @@ def check_captures(state: np.ndarray, visited: np.ndarray, marked_for_death: np.
 
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
-            if visited[x, y] or state[x, y] == EMPTY:
+            if ((visited[x, y] & 1) == 1) or (state[x, y] == EMPTY):
                 continue
 
             size, liberties = find_group_and_liberties(x, y, state, group_array, visited)
@@ -182,7 +168,7 @@ def remove_captured_stones(state: np.ndarray, marked: np.ndarray, exclude_color:
     """
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
-            if marked[x, y] != EMPTY and marked[x, y] != exclude_color:
+            if (marked[x, y] != EMPTY) and (marked[x, y] != exclude_color):
                 state[x, y] = EMPTY
 
 @njit
@@ -199,10 +185,10 @@ def apply_game_of_life(state: np.ndarray, color: int, future_state: np.ndarray) 
             same_color_count = 0
             for dx in range(-1, 2):
                 for dy in range(-1, 2):
-                    if dx == 0 and dy == 0:
+                    if (dx == 0) and (dy == 0):
                         continue
                     nx, ny = x + dx, y + dy
-                    if is_valid_position(nx, ny) and state[nx, ny] == color:
+                    if is_valid_position(nx, ny) and (state[nx, ny] == color):
                         same_color_count += 1
 
             # Применение правил
@@ -238,7 +224,7 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
 
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
-            if board[x, y] == EMPTY and not visited[x, y]:
+            if (board[x, y] == EMPTY) and not ((visited[x, y] & 1) == 1):
                 # Инициализация BFS
                 head = 0
                 tail = 0
@@ -247,7 +233,7 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
                 queue_x[tail] = x
                 queue_y[tail] = y
                 tail += 1
-                visited[x, y] = True
+                visited[x, y] |= 1
 
                 found_color = EMPTY
                 is_mixed = False
@@ -264,31 +250,31 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
                         ny = cy + dy[i]
 
                         # Проверка границ доски
-                        if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+                        if (0 <= nx < BOARD_SIZE) and (0 <= ny < BOARD_SIZE):
                             n_val = board[nx, ny]
 
                             if n_val == EMPTY:
-                                if not visited[nx, ny]:
-                                    visited[nx, ny] = True
+                                if not ((visited[nx, ny] & 1) == 1):
+                                    visited[nx, ny] |= 1
                                     queue_x[tail] = nx
                                     queue_y[tail] = ny
                                     tail += 1
+
                             else:
                                 # Сосед — камень. Проверяем цвета.
                                 if found_color == EMPTY:
                                     found_color = n_val
+
                                 elif found_color != n_val:
                                     is_mixed = True
 
                 # Если регион окружен камнями только одного цвета (и это не полностью пустая доска)
-                if found_color != EMPTY and not is_mixed:
+                if (found_color != EMPTY) and not is_mixed:
                     # Вся история посещений региона уже лежит в массиве queue от 0 до tail
                     for i in range(tail):
                         rx = queue_x[i]
                         ry = queue_y[i]
                         territory_map[rx, ry] = found_color
-
-    return
 
 @njit
 def get_opponent(color: int) -> int:
@@ -410,7 +396,7 @@ def position_permissions_numba(
     # Проверка на самоубийственный ход (используем распаковку 3 значений из новой версии функции)
     visited.fill(0)
     size, liberties = find_group_and_liberties(x, y, future_state_1, group_array, visited)
-    if liberties == 0:
+    if (liberties == 0) and (size > 0):
         return False, False
 
     # Проверка правила Суперко (Зобристово хеширование)
@@ -531,7 +517,7 @@ class Board:
 
         self.temp_group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
         self.temp_marked_for_death = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        self.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.bool_)
+        self.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
 
         self.temp_queue_x = np.zeros(board_size_sqr, dtype=np.int32)
         self.temp_queue_y = np.zeros(board_size_sqr, dtype=np.int32)
@@ -576,7 +562,7 @@ class Board:
 
         new_board.temp_group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
         new_board.temp_marked_for_death = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        new_board.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.bool_)
+        new_board.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
 
         new_board.temp_queue_x = np.zeros(board_size_sqr, dtype=np.int32)
         new_board.temp_queue_y = np.zeros(board_size_sqr, dtype=np.int32)
@@ -597,7 +583,12 @@ class Board:
 
         np.copyto(self.current_state, self.history_stack[self.history_ptr])
 
-
+    def compile(self):
+        temp_res = np.zeros(possible_moves_total, dtype=np.bool_)
+        get_legal_moves_mask_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table, BLACK, temp_res, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array,
+                                   self.temp_hash_1, self.temp_hash_2)
+        get_opponent(BLACK)
+        get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x, self.temp_queue_y)
 
     def apply_delta(self, delta_board : DeltaBoard):
 
@@ -794,31 +785,19 @@ class Board:
         np.equal(self.current_state, WHITE, out=self.temp_visited)
         white_stones = np.count_nonzero(self.temp_visited)
 
-        get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x, self.temp_queue_y)
 
-        np.equal(self.current_state, BLACK, out=self.temp_visited)
-        black_territory = np.count_nonzero(self.temp_visited) - black_stones
+        black_territory, white_territory = self.fast_territories()
 
-        np.equal(self.current_state, WHITE, out=self.temp_visited)
-        white_territory = np.count_nonzero(self.temp_visited) - white_stones
-
-
-
-
-        # Итоговый подсчет по китайским правилам
-        black_score = black_stones + black_territory
-        white_score = white_stones + white_territory
-
-        neutral_territory = board_size_sqr - black_score - white_score
+        neutral_territory = board_size_sqr - black_territory - white_territory
 
         return {
-            'black': black_score,
-            'white': white_score,
+            'black': black_territory,
+            'white': white_territory,
             'neutral': neutral_territory,
             'black_stones': black_stones,
             'white_stones': white_stones,
-            'black_territory': black_territory,
-            'white_territory': white_territory
+            'black_territory': black_territory - black_stones,
+            'white_territory': white_territory - white_stones
         }
 
 
@@ -895,10 +874,8 @@ class Board:
 
         # === 4. КАНАЛ ЦВЕТА/КОМИ ===
         # .fill() работает in-place для среза
-        if current_player_color == BLACK:
-            self.tensor[:, :, STATES_TO_NN].fill(-komi)
-        else:
-            self.tensor[:, :, STATES_TO_NN].fill(komi)
+        self.tensor[:, :, STATES_TO_NN].fill(komi)
+
 
 
     def get_network_input_pytorch(self, current_player_color: int, komi: float) -> np.ndarray:
@@ -908,3 +885,4 @@ class Board:
         self.update_network_input(current_player_color, komi)
         tensor_chw = np.transpose(self.tensor, (2, 0, 1))
         return tensor_chw
+

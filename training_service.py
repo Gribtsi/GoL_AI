@@ -114,6 +114,9 @@ def trainer_service():
 
     print("Trainer запущен. Ожидание данных...")
 
+    skips = 6
+    current_skips = 0
+
     while True:
         current_samples = get_total_samples()
         new_samples = current_samples - last_trained_samples
@@ -139,9 +142,15 @@ def trainer_service():
 
             last_trained_samples = current_samples
             print(f"Модель v{version} успешно выложена в продакшен.")
+
+            current_skips = 0
         else:
             # Спим и ждем, пока воркеры нагенерируют данные
-            print(f"Ожидание новых данных {new_samples}/{SAMPLES_PER_TRAINING} собрано")
+            current_skips += 1
+
+            if current_skips >= skips:
+                print(f"Ожидание новых данных {new_samples}/{SAMPLES_PER_TRAINING} собрано")
+                current_skips = 0
             time.sleep(10)
 
 

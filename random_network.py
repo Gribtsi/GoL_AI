@@ -5,19 +5,26 @@ import numpy as np
 
 from numpy.random import random, uniform
 
-from addresses_config import INFERENCE_SERVICE_ADDRESS
+from addresses_config import get_inference_service_address
 from board import Board
 from config import BOARD_SIZE, BLACK, WHITE, board_size_sqr, IN_CHANNELS, NN_BATCH_SIZE
 
 
 class NetworkBase:
+
+    def __init__(self, name):
+        self.name = name
+
     @abc.abstractmethod
     def predict(self, state_numpy: np.ndarray, **kwargs) -> (np.ndarray, np.float32, np.ndarray):
         pass
 
 
+
+
 class ZMQNetworkClient(NetworkBase):
-    def __init__(self, host=INFERENCE_SERVICE_ADDRESS):
+    def __init__(self, host=get_inference_service_address(0), name="ZMQClientAgent"):
+        super().__init__(name)
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         # Подключаемся к сервису в Docker
@@ -33,8 +40,13 @@ class ZMQNetworkClient(NetworkBase):
         # Блокируем выполнение, пока не придет ответ от инференс-сервера
         reply = self.socket.recv()
 
+
         # Распаковываем результат
-        policy, value, score = pickle.loads(reply)
+        policy, value, score, name = pickle.loads(reply)
+
+
+        self.name = name
+
         return policy, value, score
 
 
@@ -45,7 +57,8 @@ class RandomNetwork(NetworkBase):
     Policy имеет небольшой случайный шум, чтобы избежать равных вероятностей
     и bias к меньшим индексам действий.
     """
-    def __init__(self):
+    def __init__(self, name="RandomAgent"):
+        super().__init__(name)
         self.rollout_games = 20
         self.rollout_turns = 20
         self.randomise_value = False
@@ -107,10 +120,11 @@ class PytorchAgentWrapper(NetworkBase):
     аналогичный классу RandomNetwork.
     """
 
-    def __init__(self, model: torch.nn.Module, device: str = 'cpu'):
+    def __init__(self, model: torch.nn.Module, name="AgentWrapper", device: str = 'cpu'):
         """
         Инициализация обертки.
         """
+        super().__init__(name)
         self.device = device
 
         # 1. Гарантируем, что модель в channels_last
@@ -120,7 +134,7 @@ class PytorchAgentWrapper(NetworkBase):
         # 2. Компиляция графа (PyTorch 2.0+). mode="reduce-overhead" только для линуха
 
         if hasattr(torch, 'compile') and device == 'cuda':
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.model = torch.compile(self.model)
 
         # 3. меньше выделений НА GPU:
         # Вместо того чтобы каждый раз создавать тензор через .to(device),
@@ -166,7 +180,8 @@ class BatchedPytorchAgentWrapper:
     Поддерживает zero-allocation и защиту от рекомпиляций torch.compile.
     """
 
-    def __init__(self, model: torch.nn.Module, device: str = 'cpu'):
+    def __init__(self, model: torch.nn.Module, device: str = 'cpu', name="BatchedAgent"):
+        self.name=name
         self.device = device
         self.max_batch_size = NN_BATCH_SIZE
 
@@ -209,6 +224,7 @@ class BatchedPytorchAgentWrapper:
         self.gpu_buffer[:actual_batch_size].copy_(
             self.pinned_cpu_tensor[:actual_batch_size], non_blocking=True
         )
+        torch.cuda.synchronize()
 
         with torch.inference_mode():
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):

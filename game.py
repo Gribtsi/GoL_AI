@@ -3,19 +3,19 @@ from typing import Tuple, Union
 import numpy as np
 
 from board import Board, get_opponent, DeltaBoard
-from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME
+from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME, DRAW_AT_MAX_TURNS
 from move import encode_move
 
 
-# Предполагается, что у вас уже есть njit-версии этих функций
-# find_group_and_liberties, check_captures, remove_captured_stones, apply_game_of_life
+
+
 
 class DeltaGame:
     def __init__(self):
         self.next_mask =  np.zeros(possible_moves_total, dtype=np.float32)
         self.delta_board = DeltaBoard()
 
-        self.is_pass = 0
+        self.is_pass = False
 
         self.valid = False
 
@@ -64,6 +64,9 @@ class Game:
         self.max_moves = max_moves
         self.current_move = 0
 
+    def interrupted(self) -> bool:
+        return self.game_over and (self.current_move < MAX_MOVES_PER_GAME) and (self.get_consequtive_passes() < 2)
+
     def get_consequtive_passes(self):
         move = self.current_move
 
@@ -73,7 +76,6 @@ class Game:
             passes += 1
             move -= 1
         return passes
-
 
     def undo(self):
 
@@ -139,8 +141,6 @@ class Game:
 
         return self.legal_mask
 
-
-
     def is_valid_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, out_game: 'Game', out_delta: DeltaGame) -> bool:
         """
         Проверить легальность хода с учетом правил игры.
@@ -167,7 +167,7 @@ class Game:
 
         return True
 
-    def make_move(self, pos_x, pos_y, life_cycles, is_pass, out: DeltaGame, validate = True) -> bool:
+    def make_move(self, pos_x: int, pos_y: int, life_cycles: int, is_pass: bool, out: DeltaGame, validate = True) -> bool:
 
         if validate and self.get_legal_moves_mask()[encode_move(pos_x, pos_y, life_cycles, self.current_player, is_pass)] == 0:
             out.valid = False
@@ -180,10 +180,7 @@ class Game:
 
 
 
-        if is_pass:
-            out.is_pass = 1
-        else:
-            out.is_pass = 0
+        out.is_pass = is_pass
 
         self.pass_history[self.current_move] = is_pass
 
@@ -191,6 +188,7 @@ class Game:
 
         if self.get_consequtive_passes() >= 2:
             self.game_over = True
+
         if self.current_move >= self.max_moves:
             self.game_over = True
 
@@ -241,25 +239,15 @@ class Game:
 
         # Добавляем коми
 
-        komi_black = self.komi if self.komi < 0 else 0
+        komi_black = -self.komi if self.komi < 0 else 0
         komi_white = self.komi if self.komi > 0 else 0
 
         black_total = base_score['black'] +  komi_black
         white_total = base_score['white'] + komi_white
 
-        # Определяем победителя
-        if black_total > white_total:
-            winner = BLACK
-            margin = black_total - white_total
-            margin_no_komi = base_score['black'] - base_score['white']
-        elif white_total > black_total:
-            winner = WHITE
-            margin = white_total - black_total
-            margin_no_komi = base_score['white'] - base_score['black']
-        else:
-            winner = None
-            margin = 0.0
-            margin_no_komi = 0
+
+        winner, margin_no_komi = self.get_winner_and_margin_fast()
+        margin = margin_no_komi + komi_black + komi_white
 
         # Объединяем результаты
         result = base_score.copy()
@@ -347,19 +335,17 @@ class Game:
     def get_winner_and_margin_fast(self) -> Tuple[int,int]:
         black, white = self.board.fast_territories()
 
-        if black > white + self.komi:
-            self.winner = BLACK
-            margin = black - white
-        elif black < white + self.komi:
-            self.winner  = WHITE
-            margin = white - black
-        else:
+        if (DRAW_AT_MAX_TURNS and (self.current_move >= MAX_MOVES_PER_GAME)) or (black == (white + self.komi)):
             self.winner = EMPTY
             margin = 0
+        elif black > white + self.komi:
+            self.winner = BLACK
+            margin = black - white
+        else:
+            self.winner  = WHITE
+            margin = white - black
 
         return self.winner, margin
-
-
 
 
     def get_winner(self):
@@ -425,3 +411,4 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return json.JSONEncoder.default(self, obj)
+

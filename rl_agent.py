@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
+
 from config import BOARD_SIZE, IN_CHANNELS, CONV_CHANNELS, FEATURES, NUM_RES_BLOCKS
 
 class ResBlock(nn.Module):
@@ -25,9 +28,7 @@ class ResBlock(nn.Module):
 
 
 class RLAgent(nn.Module):
-    """
-    Нейросетевой агент в стиле AlphaGo Zero.
-    """
+
     def __init__(self):
         super(RLAgent, self).__init__()
 
@@ -38,7 +39,6 @@ class RLAgent(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # ОПТИМИЗАЦИЯ 3: nn.Sequential вместо for loop по nn.ModuleList
         self.res_blocks = nn.Sequential(
             *[ResBlock(CONV_CHANNELS) for _ in range(NUM_RES_BLOCKS)]
         )

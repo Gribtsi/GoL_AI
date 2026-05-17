@@ -1,18 +1,15 @@
 import numpy as np
 import math
 from typing import List, Tuple
-import torch
-from numba.core.types import np_int_
-
-from config import BOARD_SIZE, board_size_sqr, possible_moves_total, DEEP_DEPTH, EMPTY
+from board import get_opponent
+from config import BOARD_SIZE, board_size_sqr, possible_moves_total, DEEP_DEPTH, EMPTY, TEMP_DECAY_TURN, \
+    TEMP_DECAY_COEFF, C_PUCT, SMALL_TEMP
 from move import decode_move
 from game import Game, DeltaGame
 import time
 
 from noise import DirichletNoiseConfig
 from random_network import NetworkBase
-
-import torch.nn.functional as F
 
 _SCORES_ARRAY = np.arange(-board_size_sqr, board_size_sqr + 1, dtype=np.float32)
 def get_expected_score(score_logits: np.ndarray) -> float:
@@ -32,7 +29,7 @@ def get_expected_score(score_logits: np.ndarray) -> float:
     return float(expected_score)
 
 
-def get_score_utility(expected_score: float, scale: float = 15, max_utility: float = 0.2) -> float:
+def get_score_utility(expected_score: float, scale: float = 15, max_utility: float = 0.125) -> float:
     """
     Преобразует ожидаемый счет в очках в "Утилиту счета" для MCTS.
 
@@ -75,6 +72,10 @@ class MCTSNode:
         self.total_value = 0.0
         self.mean_value = 0.0
 
+        self.raw_value = 0.0
+        self.u_score = 0.0
+        self.u_d_score = 0.0
+
         # ВИРТУАЛЬНЫЕ дочки - только prior probabilities
         self.child_priors = {}  # {action_idx: prior_probability}
 
@@ -97,6 +98,10 @@ class MCTSNode:
         self.total_value = 0
         self.mean_value = 0.0
 
+        self.raw_value = 0.0
+        self.u_score = 0.0
+        self.u_d_score = 0.0
+
         self.child_priors.clear()
         self.children.clear()
 
@@ -113,30 +118,6 @@ class MCTSNode:
     def is_root(self) -> bool:
         """Проверить, является ли узел корнем."""
         return self.parent is None
-
-    def get_ucb_score(self, c_puct: float = 1.25, parent_visit_count: int = 1) -> float:
-        """
-        Вычислить PUCT (Predictor + UCB applied to Trees) для этого узла.
-
-        Формула AlphaZero:
-        U(s,a) = Q(s,a) + C(s) * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-
-        Где C(s) = c_puct (упрощенная версия, без log)
-
-        Args:
-            c_puct: Коэффициент исследования (exploration constant)
-            parent_visit_count: N(s) - количество посещений родительского узла
-
-        Returns:
-            UCB score для этого узла
-        """
-        # Q-value (exploitation)
-        q_value = self.mean_value
-
-        # U-value (exploration)
-        u_value = c_puct * self.prior_prob * math.sqrt(parent_visit_count) / (1 + self.visit_count)
-
-        return q_value + u_value
 
     def count_terminal_nodes_in_tree(self):
         sum = 0
@@ -160,12 +141,17 @@ class MCTSNode:
         self.noise_added = True
 
         legal_mask = game_state.get_legal_moves_mask()
-        policy_array = np.zeros(BOARD_SIZE * BOARD_SIZE * 2 + 1, dtype=np.float32)
 
-        policy_array[list(self.child_priors.keys())] = list(self.child_priors.values())
+        noise = noise_config.get_noise(legal_mask)
+        frac = noise_config.exploration_fraction
 
-        self.prior_prob = noise_config.add_noise(policy_array, legal_mask)
+        for action_idx in list(self.child_priors.keys()):
+            old_p = self.child_priors[action_idx]
+            new_p = (1.0 - frac) * old_p + frac * noise[action_idx]
+            self.child_priors[action_idx] = float(new_p)
 
+            if action_idx in self.children:
+                self.children[action_idx].prior_prob = float(new_p)
 
 
 class MCTS_Agent:
@@ -181,7 +167,7 @@ class MCTS_Agent:
     def has_network(self):
         return self.network is not None
 
-    def __init__(self, network : NetworkBase = None, c_puct: float = 1.25,
+    def __init__(self, network : NetworkBase = None, c_puct: float = C_PUCT,
                  temperature: float = 1.0, noise_config: DirichletNoiseConfig = None, **kwargs):
         """
         Args:
@@ -191,7 +177,11 @@ class MCTS_Agent:
         """
         self.network = network
         self.c_puct = c_puct
+
+        self.initial_temperature = temperature
         self.temperature = temperature
+
+
 
         self.game_state : Game = Game()
 
@@ -203,7 +193,9 @@ class MCTS_Agent:
         if 'score_goal_factor' in kwargs:
             self.score_goal_factor = kwargs['score_goal_factor']
         else:
-            self.score_goal_factor = 1
+            self.score_goal_factor = 0.2
+
+
 
         self.node_pool = []
         for i in range(DEEP_DEPTH + 1):
@@ -243,7 +235,7 @@ class MCTS_Agent:
         self.node_pool.append(node)
 
 
-    def search(self, root: MCTSNode = None, num_simulations: int = 1600) -> Tuple[int,int,int,int,bool, np.ndarray, MCTSNode]:
+    def search(self, root: MCTSNode = None, num_simulations: int = DEEP_DEPTH) -> Tuple[int,int,int,int,bool, np.ndarray, MCTSNode]:
         """
         Запустить MCTS поиск для текущего состояния игры.
 
@@ -268,6 +260,11 @@ class MCTS_Agent:
         else:
             self.set_new_root(root)
 
+        self.temperature = self.initial_temperature
+        if self.game_state.current_move > TEMP_DECAY_TURN:
+            for i in range(self.game_state.current_move - TEMP_DECAY_TURN):
+                self.temperature *= TEMP_DECAY_COEFF
+
         self.root_player = self.game_state.current_player
 
         if self.root.is_expanded:
@@ -285,7 +282,6 @@ class MCTS_Agent:
                 search_path.append(node)
 
             # 2. Expansion: если узел не терминальный, разворачиваем его
-            value = 0.0
             if not self.game_state.game_over:
                 value = self._expand_node(node)
             else:
@@ -298,6 +294,8 @@ class MCTS_Agent:
 
         # Выбираем лучший ход на основе visit counts
         x, y, life_cycle, color, is_pass, policy_distribution, best_node = self._select_action()
+
+
 
         #elapsed_time = time.time() - start_time
         #print(f"Время поиска лучшего хода search: {elapsed_time:.2f} сек")
@@ -320,7 +318,10 @@ class MCTS_Agent:
             if action_idx in node.children:
                 # Реальный дочерний узел - используем его статистику
                 child = node.children[action_idx]
-                ucb_score = child.get_ucb_score(self.c_puct, node.visit_count)
+                q_value = -child.mean_value
+                u_value = self.c_puct * child.prior_prob * math.sqrt(node.visit_count + 1) / (1 + child.visit_count)
+                ucb_score = q_value + u_value
+
             else:
                 # Виртуальный узел (еще не создан)
                 # Q(s,a) = 0 для непосещенного узла
@@ -374,8 +375,7 @@ class MCTS_Agent:
         state_tensor = self.game_state.get_network_input_pytorch()
 
         # Предсказание от нейросети: policy (723,) и value (скаляр)
-        policy, value, score = self.network.predict(state_tensor)
-
+        policy, raw_value, score = self.network.predict(state_tensor)
 
         # Получаем маску легальных ходов
         legal_mask = self.game_state.get_legal_moves_mask()
@@ -383,8 +383,6 @@ class MCTS_Agent:
         # Применяем маску к policy (обнуляем нелегальные ходы)
         masked_policy = policy * legal_mask
 
-        if node == self.root:
-            node.add_noise(self.noise_config, self.game_state)
 
         # Нормализуем policy
         policy_sum = np.sum(masked_policy)
@@ -400,17 +398,24 @@ class MCTS_Agent:
             if legal_mask[action_idx] > 0:
                 node.child_priors[action_idx] = masked_policy[action_idx]
 
+        if node == self.root:
+            node.add_noise(self.noise_config, self.game_state)
 
-        utility = value
+        utility = raw_value
 
         expected_score = get_expected_score(score)
         node.expected_score = expected_score
+
 
         utility += get_score_utility(expected_score) * self.score_goal_factor
 
         root_score_from_current_perspective = -self.root.expected_score if self.game_state.current_player != self.root_player else self.root.expected_score
         score_delta = expected_score - root_score_from_current_perspective
         utility += get_score_utility(score_delta) * self.score_goal_factor
+
+        node.raw_value = raw_value
+        node.u_score = get_score_utility(expected_score) * self.score_goal_factor
+        node.u_d_score = get_score_utility(score_delta) * self.score_goal_factor
 
         node.is_expanded = True
 
@@ -432,13 +437,12 @@ class MCTS_Agent:
         """
 
         winner, score = self.game_state.get_winner_and_margin_fast()
-        current_player = self.game_state.current_player
 
         utility = get_score_utility(score) * self.score_goal_factor  # В пользу победителя всегда
 
-        if winner is EMPTY:
+        if winner == EMPTY:
             return 0.0  # Ничья
-        elif winner == current_player:
+        elif winner == self.game_state.current_player:
             return 1.0 + utility  # Победа
         else:
             return -1.0 - utility # Поражение
@@ -454,14 +458,13 @@ class MCTS_Agent:
 
         skips = 1
         for node in reversed(search_path):
-            # Инвертируем value для родителя (zero-sum game)
-            # Инверсия в начале, потому что кажется, что где-то еще есть другая инверсия, и все рушится. Кажется. Но? По идее, да.
-            value = -value
-
 
             node.visit_count += 1
             node.total_value += value
             node.mean_value = node.total_value / node.visit_count
+
+            value = -value
+
 
             if skips <= 0:
                 self.game_state.undo()
@@ -483,7 +486,7 @@ class MCTS_Agent:
             visit_counts[action_idx] = child.visit_count
 
         # Применяем температуру для сэмплирования
-        if self.temperature == 0:
+        if self.temperature <= SMALL_TEMP:
             # Детерминированный выбор (максимум)
             action_idx = np.argmax(visit_counts)
         else:

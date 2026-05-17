@@ -20,45 +20,10 @@ class DirichletNoiseConfig:
         self.alpha = alpha
         self.enabled = enabled
 
-    def add_noise(self, policy: np.ndarray, legal_mask: np.ndarray) -> np.ndarray:
-        """
-        Добавить шум Дирихле к policy.
-
-        Args:
-            policy: Исходная policy от нейросети (уже нормализованная)
-            legal_mask: Маска легальных ходов
-
-        Returns:
-            Policy с добавленным шумом
-        """
-        if not self.enabled:
-            return policy
-
-        # Количество легальных ходов
-        num_legal = int(np.sum(legal_mask))
-
-        if num_legal == 0:
-            return policy
-
-        # Генерируем шум Дирихле только для легальных ходов
-        noise = np.zeros_like(policy)
-        legal_indices = np.where(legal_mask > 0)[0]
-
-        # Дирихле для легальных ходов
-        dirichlet_noise = np.random.dirichlet([self.alpha] * num_legal)
-        noise[legal_indices] = dirichlet_noise
-
-        # Смешиваем policy с шумом
-        noisy_policy = (1 - self.epsilon) * policy + self.epsilon * noise
-
-        noisy_policy = noisy_policy / np.sum(noisy_policy)
-
-        return noisy_policy
-
     @staticmethod
     def for_selfplay() -> 'DirichletNoiseConfig':
         """Конфигурация для self-play обучения (шум отключен)."""
-        return DirichletNoiseConfig(epsilon=0.5, alpha=0.6, enabled=True)
+        return DirichletNoiseConfig(epsilon=0.25, alpha=0.15, enabled=True)
 
     @staticmethod
     def for_tournament() -> 'DirichletNoiseConfig':
@@ -69,3 +34,33 @@ class DirichletNoiseConfig:
     def for_human_play() -> 'DirichletNoiseConfig':
         """Конфигурация для игры с человеком (шум включен, но слабее)."""
         return DirichletNoiseConfig(epsilon=0.15, alpha=0.3, enabled=True)
+
+    @property
+    def exploration_fraction(self) -> float:
+        return self.epsilon
+
+    def get_noise(self, legal_mask: np.ndarray) -> np.ndarray:
+        """
+        Возвращает вектор шума длины legal_mask.shape[0].
+        Нелегальные ходы получают 0.
+        Легальные ходы получают распределение Dirichlet.
+        """
+        legal_mask = np.asarray(legal_mask)
+        if legal_mask.ndim != 1:
+            raise ValueError("legal_mask must be a 1D array")
+
+        noise = np.zeros_like(legal_mask, dtype=np.float32)
+
+        if not self.enabled:
+            return noise
+
+        legal_indices = np.flatnonzero(legal_mask > 0)
+        if legal_indices.size == 0:
+            return noise
+
+        dirichlet = np.random.dirichlet(
+            [self.alpha] * legal_indices.size
+        ).astype(np.float32)
+
+        noise[legal_indices] = dirichlet
+        return noise

@@ -2,11 +2,16 @@ import os
 import time
 import uuid
 
+import multiprocessing as mp
+import gc
+
 import argparse
 from datetime import datetime
 
-from addresses_config import MODEL_PROVIDER_ADDRESS, WRITER_ADDRESS
-from config import MAX_MOVES_PER_GAME
+from addresses_config import MODEL_PROVIDER_ADDRESS, WRITER_ADDRESS, get_inference_service_address
+from board import Board
+from config import MAX_MOVES_PER_GAME, BLACK, WHITE, PROCESSES_PER_WORKER, symbols, EMPTY, MAX_KOMI, \
+    ENABLE_KOMI_BALANCING
 from game_data_sender import GameDataSender
 from mcts_agent import MCTS_Agent
 from model_manager import ModelManager
@@ -16,7 +21,9 @@ from self_play import self_play, process_game_history
 
 
 
-def run_worker(writer_address, provider_address, device="cuda"):
+def run_worker(writer_address, process_id: int = 0):
+    gc.enable()
+
     sender = GameDataSender(writer_address)
 
     # Будем сохранять скачанные модели во временную директорию ОС (в докере это /tmp)
@@ -27,46 +34,61 @@ def run_worker(writer_address, provider_address, device="cuda"):
     #model_manager = ModelManager(RLAgent, save_dir=temp_dir, device=device)
 
     #current_model_version = None
-    wrapper = ZMQNetworkClient()
+    wrapper = ZMQNetworkClient(host=get_inference_service_address(process_id))
     rl_agent = MCTS_Agent(temperature=1.0)
     rl_agent.set_network(wrapper)
 
     index = 0
 
-    print("Воркер запущен. Ожидание первой модели...")
+    whites, blacks, draws = 0,0,0
+
+    current_komi_offset = 0
+
+    threshold = 0.6
+
+    correction_period = 20
+
+    print(f"Воркер запущен. Инференс через {get_inference_service_address(process_id)}")
 
     while True:
-
-        # 1. Проверяем, есть ли новая модель (или ждем, пока Тренер создаст первую)
-        #new_version, is_updated = model_client.get_latest_model(current_model_version)
-
-        #if new_version is None:
-        #    print("Модель еще не готова, ждем 5 секунд...")
-        #    time.sleep(5)
-        #    continue
-
-        # 2. Если модель обновилась (или это первый запуск), обновляем агента
-        #if is_updated or not rl_agent.has_network():
-        #    print(f"=== Инициализация агента с весами {new_version} ===")
-        #    best_model = model_manager.load_model_weights(new_version)
-        #    network = PytorchAgentWrapper(best_model, device=device)
-
-        #    # Создаем агента заново, чтобы очистить все старые MCTS-деревья
-        #    rl_agent.set_network(network)
-        #    current_model_version = new_version
-
         # 3. Генерируем 1 игру (Self-Play)
-        print(f"Игра {index:05d} стартовала {time.time()}")
         start_time = time.time()
 
-        history, game = self_play(agent=rl_agent, max_moves=MAX_MOVES_PER_GAME, visualise=False)
+        history, game = self_play(agent=rl_agent, visualise=False, komi_offset=current_komi_offset)
+
+        interrupted = game.interrupted()
 
         # 4. Формируем данные
         game_data = process_game_history(
             history=history,
             final_board_state=game.board.current_state,
-            score=game.get_score()
+            score=game.get_score(),
+            agent_name=rl_agent.network.name
         )
+
+
+
+        if game_data['winner_meta'] == BLACK:
+            blacks += 1
+            res_str = symbols[BLACK]
+        elif game_data['winner_meta'] == WHITE:
+            whites += 1
+            res_str = symbols[WHITE]
+        else:
+            draws += 1
+            res_str = symbols[EMPTY]
+
+        total = blacks + whites
+        if ENABLE_KOMI_BALANCING and (total + draws) >= correction_period:
+            if blacks / total > threshold and current_komi_offset <= MAX_KOMI:
+                current_komi_offset += 1
+            elif whites / total > threshold and current_komi_offset >= -MAX_KOMI:
+                current_komi_offset -= 1
+
+            blacks = 0
+            whites = 0
+            draws = 0
+
 
         # 5. Отправляем писателю
         game_id = f"game_{index:05d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -76,7 +98,7 @@ def run_worker(writer_address, provider_address, device="cuda"):
         rl_agent.flush()
 
         duration = time.time() - start_time
-        print(f"Игра завершена за {duration:.1f} сек. Ходов: {len(history)}\n")
+        print(f"Игра завершена за {duration:.1f} сек. Ходов: {len(history)} Поб {res_str}. Сдвиг {current_komi_offset}. Раннее завершение {interrupted}")
 
         index += 1
 
@@ -86,6 +108,20 @@ if __name__ == "__main__":
     parser.add_argument("--writer", type=str, default=WRITER_ADDRESS)
     parser.add_argument("--provider", type=str, default=MODEL_PROVIDER_ADDRESS)
     parser.add_argument("--device", type=str, default="cuda")
+
     args = parser.parse_args()
 
-    run_worker(args.writer, args.provider, args.device)
+    mp.set_start_method('fork')
+    gc.freeze()
+
+    compile_board = Board()
+    compile_board.compile()
+
+    processes = []
+    for i in range(PROCESSES_PER_WORKER):
+        p = mp.Process(target=run_worker, args=(args.writer, i))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()

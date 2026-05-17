@@ -1,17 +1,17 @@
 
 import time
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, List
 
 from IPython.display import clear_output
 from numpy.random import uniform
 
 from game import Game
-from game_data_sender import GameDataSender
 from mcts_agent import MCTS_Agent
 from move import move_to_dict
 from config import EMPTY, DEEP_DEPTH, SHALLOW_DEPTH, UNTIL_THE_END_CHANCE, CONCEDE_AT, \
-    DEEP_SEARCH_CHANCE, BOARD_SIZE, possible_moves_total, IN_CHANNELS
+    DEEP_SEARCH_CHANCE, BOARD_SIZE, possible_moves_total, IN_CHANNELS, MIN_TURNS, MAX_MOVES_PER_GAME, \
+    EXPECTED_MAX_LENGTH, LONG_GAME_VALUE, GAME_LENGTH_PENALTY_WEIGHT, symbols, PUNISH_LONG_GAME
 import numpy as np
 import json
 import h5py
@@ -30,19 +30,25 @@ def generate_name():
     return game_id
 
 
-def process_game_history(history: list, final_board_state: np.ndarray, score: dict) -> dict:
+def process_game_history(history: list, final_board_state: np.ndarray, score: dict, agent_name: str) -> dict:
     """
     Подготавливает историю игры в виде словаря NumPy-массивов
     для прямой и быстрой записи в HDF5-датасет.
     """
-    filtered_history = [turn for turn in history if turn.get('deep_search')]
+    game_length = len(history)
 
-    num_turns = len(filtered_history)
+    filtered_items = [
+        (i, turn) for i, turn in enumerate(history)
+        if turn.get('deep_search')
+    ]
+
+    num_turns = len(filtered_items)
 
     # Заранее выделяем память под скалярные массивы
     values = np.zeros(num_turns, dtype=np.float32)
     scores = np.zeros(num_turns, dtype=np.float32)
-    turns = np.arange(num_turns, dtype=np.int32)
+    turns = np.array([i for i, _ in filtered_items], dtype=np.int32)
+    filtered_history = [turn for _, turn in filtered_items]
 
     # Списки для тензоров (размеры могут зависеть от конфигурации,
     # np.array() в конце соберет их в (N, C, H, W) или подобный формат)
@@ -55,24 +61,27 @@ def process_game_history(history: list, final_board_state: np.ndarray, score: di
     moves_meta = []
 
     winner = score.get('winner')
+
     margin = int(score.get('margin_no_komi', 0))
 
-    for i, turn_data in enumerate(filtered_history):
+    pure_value = 1
+    penalty = max(0.0, (game_length - EXPECTED_MAX_LENGTH) / (MAX_MOVES_PER_GAME - EXPECTED_MAX_LENGTH)) * GAME_LENGTH_PENALTY_WEIGHT
 
-        if not turn_data['deep_search']:
-            continue
+    adjusted_value = pure_value - penalty if PUNISH_LONG_GAME else pure_value
+
+    for i, turn_data in enumerate(filtered_history):
 
         current_player = turn_data['player']
 
         # 1. Расчет Value и Score
         if current_player == winner:
-            values[i] = 1.0
+            values[i] = adjusted_value
             scores[i] = margin
-        elif winner is None:
-            values[i] = 0.0
+        elif winner == EMPTY:
+            values[i] = LONG_GAME_VALUE
             scores[i] = 0
         else:
-            values[i] = -1.0
+            values[i] = -pure_value
             scores[i] = -margin
 
         # 2. Быстрый расчет территорий (векторизация NumPy вместо двойного цикла)
@@ -98,7 +107,9 @@ def process_game_history(history: list, final_board_state: np.ndarray, score: di
         'territories': np.array(territories_list, dtype=np.float32),
         'turn': turns,
         # Сохраняем как массив байтовых строк (строковый тип, понятный HDF5)
-        'move_meta': np.array(moves_meta, dtype='S')
+        'move_meta': np.array(moves_meta, dtype='S'),
+        'winner_meta': winner,
+        'agent_meta': agent_name
     }
 
 
@@ -159,13 +170,26 @@ def save_game_to_hdf5(h5_file_path: str, game_data: dict, game_id: str = None):
         for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
             dset.flush()
 
+BAD_VALUES_COUNT = 3
+
+def all_less_than_threshold(threshold : float, values: List[float], current_ptr : int):
+    values_sum = 0
+    index = current_ptr
+    for i in range(BAD_VALUES_COUNT):
+        values_sum += values[index]
+        index = (index + 2) % (BAD_VALUES_COUNT * 2)
+    values_sum /= BAD_VALUES_COUNT
+
+    return values_sum < threshold
 
 
-def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, extra_text : str = None) -> Tuple[list, Game]:
+
+
+def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = None, delay: float = 0, komi_offset: float = 0) -> Tuple[list, Game]:
 
     game : Game = agent.game_state
 
-    komi, flat_komi = generate_komi()
+    komi, flat_komi = generate_komi(komi_offset)
 
     game.set_komi(komi)
 
@@ -173,6 +197,9 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
 
     best_node = None
     history = []
+
+    values_cache = [0] * BAD_VALUES_COUNT * 2
+    values_cache_ptr = 0
 
     if visualise:
         print("=" * 60)
@@ -184,14 +211,16 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
     else:
         till_the_end_str = ''
 
-    while (game is None) or (not game.game_over) and (game.current_move < max_moves):
+    while (game is not None) and (not game.game_over):
+
+        started = time.time()
 
         if visualise:
             clear_output(wait=True)
             print("=" * 60)
             if extra_text is not None:
                 print(extra_text)
-            print(f"ХОД {game.current_move + 1}{till_the_end_str}")
+            print(f"ХОД {game.current_move + 1}{till_the_end_str} {[f'{values_cache[i]:.2f}' for i in range(values_cache_ptr-1, values_cache_ptr - 1 - BAD_VALUES_COUNT * 2, -1)]}")
             print(game.get_header_text())
             print("=" * 60)
 
@@ -217,12 +246,20 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
             'deep_search': is_deep
         })
 
+        values_cache[values_cache_ptr] = agent.root.mean_value
+
+
+        if (not till_the_end) and (game.current_move > MIN_TURNS):
+            if all_less_than_threshold(CONCEDE_AT, values_cache, values_cache_ptr) and game.current_player != game.get_winner():
+                game.game_over = True
+
+
+        values_cache_ptr = (values_cache_ptr + 1) % (BAD_VALUES_COUNT * 2)
         game.apply_delta(best_node.delta_game)
 
-        if not till_the_end:
-            if (best_node.mean_value > CONCEDE_AT) and (
-                    game.get_current_leader() != game.current_player):  # У нас инверсия откуда-то яхз взялась, поэтому знак больше
-                game.game_over = True
+        elapsed = time.time() - started
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
 
     if visualise:
         clear_output(wait=True)
@@ -243,27 +280,34 @@ def self_play(agent: MCTS_Agent, max_moves: int = 300, visualise : bool = True, 
 
 def generate_self_play_games(
         games_to_generate: int,
-        rl_agent: MCTS_Agent, max_moves: int,
-        file_path: str, log: bool):
+        rl_agent: MCTS_Agent,
+        file_path: str, log: bool, write: bool):
 
     start_time = time.time()
 
+    results = []
+
     for index in range(games_to_generate):
 
-            text = f"ИГРА {index + 1}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
+        text = f"ИГРА {index + 1}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
 
-            history, game = self_play(agent=rl_agent, max_moves=max_moves, extra_text=text, visualise=log)
+        history, game = self_play(agent=rl_agent, extra_text=text, visualise=log)
 
-            game_data = process_game_history(
-                history=history,
-                final_board_state=game.board.current_state,
-                score=game.get_score(),
-            )
+        game_data = process_game_history(
+            history=history,
+            final_board_state=game.board.current_state,
+            score=game.get_score(),
+            agent_name=rl_agent.network.name
+        )
 
-            samples = len(game_data['turn'])
-            if samples > 0:
-                save_game_to_hdf5(file_path, game_data, generate_name())
+        samples = len(game_data['turn'])
+        if samples > 0 and write:
+            save_game_to_hdf5(file_path, game_data, generate_name())
 
-            rl_agent.flush()
+        results.append(game.get_winner())
 
+        rl_agent.flush()
+
+
+    return  results
 

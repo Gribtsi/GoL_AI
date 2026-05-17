@@ -6,7 +6,8 @@ import msgpack
 import msgpack_numpy as m
 import os
 
-from config import IN_CHANNELS, BOARD_SIZE, possible_moves_total
+from config import IN_CHANNELS, BOARD_SIZE, possible_moves_total, BLACK, WHITE
+
 m.patch()
 import numpy as np
 from addresses_config import DATASETS_FILEPATH, WRITER_ADDRESS, DATASET_COUNT_ADDRESS
@@ -41,16 +42,17 @@ def game_data_writer_service():
     poller.register(pull_socket, zmq.POLLIN)
     poller.register(info_socket, zmq.POLLIN)
 
-
+    white_wins = 0
+    black_wins = 0
+    draws = 0
+    total_games = 0
+    agent_samples = 0
+    current_agent_name = ""
 
     print(f"HDF5 Writer запущен. Слушаю \n{WRITER_ADDRESS}\n{DATASET_COUNT_ADDRESS}")
-    # 1. Открываем файл ОДИН РАЗ перед циклом (Writer)
     with h5py.File(DATASETS_FILEPATH, 'a', libver='latest') as f:
 
-        # 2. Если файл пустой (только создался), инициализируем датасеты
         if 'state_tensor' not in f:
-            # Задаем maxshape=(None, ...) чтобы они могли расти бесконечно.
-            # chunks обязательно нужно настроить (здесь для примера беру (128, ...))
             f.create_dataset('state_tensor', shape=(0, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), maxshape=(None, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), chunks=(4, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE),
                              dtype='float32', compression='lzf')
             f.create_dataset('mcts_policy', shape=(0, possible_moves_total), maxshape=(None, possible_moves_total), chunks=(32, possible_moves_total), dtype='float32',
@@ -106,10 +108,22 @@ def game_data_writer_service():
                     game_data = msgpack.unpackb(encoded_data, raw=False)
                     added_samples = len(game_data['turn'])
 
+
                     if added_samples == 0:
                         continue
 
+                    winner = game_data['winner_meta']
+                    agent_name = game_data['agent_meta']
+
+                    if winner == BLACK:
+                        black_wins += 1
+                    elif winner == WHITE:
+                        white_wins += 1
+                    else:
+                        draws += 1
+
                     new_total = total_samples + added_samples
+                    agent_samples += added_samples
 
                     # 4. Расширяем датасеты (resize)
                     for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
@@ -132,7 +146,25 @@ def game_data_writer_service():
                         dset.flush()
 
                     total_samples = new_total
-                    print(f"Сохранена партия {game_id}. Ходов: {added_samples}. Всего сэмплов: {total_samples}")
+
+                    total_games += 1
+
+
+                    if current_agent_name != agent_name:
+
+                        line = (
+                            f"Агент {current_agent_name} создал {total_games} игр средней длиной "
+                            f"{agent_samples / total_games:.1f} ходов "
+                            f"Счет Ч{black_wins}/Б{white_wins} Н{draws}"
+                        )
+                        print(line)
+
+                        black_wins = 0
+                        white_wins = 0
+                        draws = 0
+                        total_games = 0
+                        agent_samples = 0
+                        current_agent_name = agent_name
 
                 except Exception as e:
                     print(f"Ошибка при записи {game_id}: {e}")

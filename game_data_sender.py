@@ -23,4 +23,5 @@ class GameDataSender:
 
         # Отправляем фреймы: [ID игры, Байты данных]
         self.socket.send_multipart([game_id.encode('utf-8'), encoded_data])
-        print(f"Партия {game_id} отправлена на запись.")
+
+        #print(f"Партия {game_id} отправлена на запись.")

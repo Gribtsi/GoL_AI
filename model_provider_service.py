@@ -14,7 +14,9 @@ def model_provider_service():
     socket.bind(MODEL_PROVIDER_ADDRESS)
 
     os.makedirs(MODELS_DIR, exist_ok=True)
-    current_model_path = os.path.join(MODELS_DIR, "agent_v0.pth")
+    current_model_name = "agent_v0.pth"
+    current_model_path = os.path.join(MODELS_DIR, current_model_name)
+
 
     # Если начальной модели нет, ждем пока Тренер или другой скрипт ее создаст
     print(f"Model Provider запущен на {MODEL_PROVIDER_ADDRESS}")
@@ -34,6 +36,9 @@ def model_provider_service():
 
             else:
                 socket.send_multipart([b"ERROR", b"Model not found yet"])
+
+        elif command == "GET_MODEL_NAME":
+            socket.send_multipart([current_model_name.encode('utf-8')])
 
         elif command == "UPDATE_MODEL":
             # Команда от Тренера о том, что появилась новая модель

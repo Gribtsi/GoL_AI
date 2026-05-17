@@ -16,6 +16,7 @@ class TrainingDataset(Dataset):
         self.datasets_filepath = datasets_filepath
         self.buffer_length = buffer_length
         self.file = None
+        self.augment = True
 
         # Узнаем текущий размер файла ОДИН раз при инициализации
         with h5py.File(self.datasets_filepath, 'r', swmr=True, libver='latest') as f:
@@ -53,6 +54,10 @@ class TrainingDataset(Dataset):
         value = self.d_value[actual_idx]
         terr = self.d_terr[actual_idx]
         score = self.d_score[actual_idx] + board_size_sqr
+
+        if self.augment:
+            state, policy, terr = augment_data(state, policy, terr)
+
 
         value = np.array([value], dtype=np.float32)
 
@@ -160,7 +165,8 @@ def train_network_steps(
 
         pred_policy_logits, pred_value, pred_territory, pred_score_logits = model(state_batch)
 
-        value_loss = F.mse_loss(pred_value, value_batch)
+
+        value_loss = F.mse_loss(pred_value.squeeze(-1), value_batch.squeeze(-1))
         terr_loss = F.mse_loss(pred_territory, terr_batch)
         score_loss = F.cross_entropy(pred_score_logits, score_batch)
 
