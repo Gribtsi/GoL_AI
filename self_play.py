@@ -30,7 +30,7 @@ def generate_name():
     return game_id
 
 
-def process_game_history(history: list, final_board_state: np.ndarray, score: dict, agent_name: str) -> dict:
+def training_data_from_game(history: list, final_board_state: np.ndarray, score: dict, agent_name: str, noise_seed: int) -> dict:
     """
     Подготавливает историю игры в виде словаря NumPy-массивов
     для прямой и быстрой записи в HDF5-датасет.
@@ -95,8 +95,7 @@ def process_game_history(history: list, final_board_state: np.ndarray, score: di
         territories_list.append(territories)
 
         # 4. Обработка метаданных (конвертация словаря в строку для HDF5)
-        move_dict = turn_data['move']
-        moves_meta.append(json.dumps(move_dict).encode('utf-8'))
+        moves_meta.append(turn_data['move'])
 
     # Возвращаем "колонки" данных
     return {
@@ -107,68 +106,49 @@ def process_game_history(history: list, final_board_state: np.ndarray, score: di
         'territories': np.array(territories_list, dtype=np.float32),
         'turn': turns,
         # Сохраняем как массив байтовых строк (строковый тип, понятный HDF5)
-        'move_meta': np.array(moves_meta, dtype='S'),
+        'move_meta': np.array(moves_meta, dtype=np.int32),
         'winner_meta': winner,
-        'agent_meta': agent_name
+        'agent_meta': agent_name,
+        'noise_seed_meta': noise_seed
     }
 
+def game_log_from_game(history: list, result: dict, agent_name: str) -> dict:
+    game_length = len(history)
 
-def save_game_to_hdf5(h5_file_path: str, game_data: dict, game_id: str = None):
-    """
-    Сохраняет обработанную партию в HDF5 базу данных.
-    """
-    if game_id is None:
-        game_id = generate_name()
+    turns = np.arange(game_length, dtype=np.int32)
+    players = np.array([turn['player'] for turn in history], dtype=np.int8)
+    deep_search = np.array([bool(turn.get('deep_search', False)) for turn in history], dtype=np.bool_)
+    moves = np.array([i['move'] for i in history], dtype=np.int32)
 
-    with h5py.File(h5_file_path, 'a', libver=('v110','latest')) as f:
-        if 'state_tensor' not in f:
-            # Задаем maxshape=(None, ...) чтобы они могли расти бесконечно.
-            # chunks обязательно нужно настроить (здесь для примера беру (128, ...))
-            f.create_dataset('state_tensor', shape=(0, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), maxshape=(None, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), chunks=(4, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE),
-                             dtype='float32', compression='lzf')
-            f.create_dataset('mcts_policy', shape=(0, possible_moves_total), maxshape=(None, possible_moves_total), chunks=(32, possible_moves_total), dtype='float32',
-                             compression='lzf')
-            f.create_dataset('territories', shape=(0, BOARD_SIZE, BOARD_SIZE), maxshape=(None, BOARD_SIZE, BOARD_SIZE), chunks=(64, BOARD_SIZE, BOARD_SIZE),
-                             dtype='int8', compression='lzf')
-            f.create_dataset('value', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='float32')
-            f.create_dataset('score', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int64')
-            f.create_dataset('turn', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int32')
-            f.create_dataset('move_meta', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='S32')
-            f.create_dataset('game_id', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='S32')
+    return {
+        'agent_meta': agent_name.encode('utf-8'),
+        'game_length': np.int32(game_length),
 
-        d_state = f['state_tensor']
-        d_policy = f['mcts_policy']
-        d_terr = f['territories']
-        d_value = f['value']
-        d_score = f['score']
-        d_turn = f['turn']
-        d_meta = f['move_meta']
-        d_gameid = f['game_id']
+        'turn': turns,
+        'player': players,
+        'deep_search': deep_search,
+        'move': moves,
 
-        total_samples = d_state.shape[0]
+        'winner': np.int8(result.get('winner', 0)),
+        'margin': np.float32(result.get('margin', 0)),
+        'margin_no_komi': np.float32(result.get('margin_no_komi', 0)),
 
-        added_samples = len(game_data['turn'])
+        'black_total': np.float32(result.get('black', 0)),
+        'white_total': np.float32(result.get('white', 0)),
+        'neutral': np.int32(result.get('neutral', 0)),
 
-        if added_samples == 0:
-            return
+        'black_stones': np.int32(result.get('black_stones', 0)),
+        'white_stones': np.int32(result.get('white_stones', 0)),
+        'black_territory': np.int32(result.get('black_territory', 0)),
+        'white_territory': np.int32(result.get('white_territory', 0)),
 
-        new_total = total_samples + added_samples
+        'black_base': np.float32(result.get('black_base', 0)),
+        'white_base': np.float32(result.get('white_base', 0)),
+        'black_komi': np.float32(result.get('black_komi', 0)),
+        'white_komi': np.float32(result.get('white_komi', 0)),
+        'max_komi': np.float32(result.get('max_komi', 0)),
+    }
 
-        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
-            dset.resize((new_total,) + dset.shape[1:])
-
-        d_state[total_samples:new_total] = game_data['state_tensor']
-        d_policy[total_samples:new_total] = game_data['mcts_policy']
-        d_terr[total_samples:new_total] = game_data['territories']
-        d_value[total_samples:new_total] = game_data['value']
-        d_score[total_samples:new_total] = game_data['score']
-        d_turn[total_samples:new_total] = game_data['turn']
-        d_meta[total_samples:new_total] = np.array(game_data['move_meta']).astype('S32')
-
-        d_gameid[total_samples:new_total] = np.array([game_id] * added_samples).astype('S32')
-
-        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
-            dset.flush()
 
 BAD_VALUES_COUNT = 3
 
@@ -182,10 +162,7 @@ def all_less_than_threshold(threshold : float, values: List[float], current_ptr 
 
     return values_sum < threshold
 
-
-
-
-def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = None, delay: float = 0, komi_offset: float = 0) -> Tuple[list, Game]:
+def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = None, delay: float = 0, komi_offset: float = 0, deep_search_chance = DEEP_SEARCH_CHANCE) -> Tuple[list, Game]:
 
     game : Game = agent.game_state
 
@@ -227,14 +204,14 @@ def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = Non
             print(game.board.board_with_permissions_as_text(game.current_player, game.get_legal_moves_mask()))
 
 
-        is_deep = (uniform(0, 1) <= DEEP_SEARCH_CHANCE)
+        is_deep = (uniform(0, 1) <= deep_search_chance)
 
         depth = DEEP_DEPTH if is_deep else SHALLOW_DEPTH
 
         if best_node is None:
-            x, y, life_cycle, color, is_pass, policy, best_node = agent.search(num_simulations=depth)
+            encoded_move, policy, best_node = agent.search(num_simulations=depth)
         else:
-            x, y, life_cycle, color, is_pass, policy, best_node = agent.search(root=best_node, num_simulations=depth)
+            encoded_move, policy, best_node = agent.search(root=best_node, num_simulations=depth)
 
         current_state_tensor = game.get_network_input_pytorch()
 
@@ -242,17 +219,15 @@ def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = Non
             'state_tensor': current_state_tensor.copy(),
             'mcts_policy': policy,
             'player': game.current_player,
-            'move': move_to_dict(x, y, life_cycle, color, is_pass),
+            'move': encoded_move,
             'deep_search': is_deep
         })
 
         values_cache[values_cache_ptr] = agent.root.mean_value
 
-
         if (not till_the_end) and (game.current_move > MIN_TURNS):
             if all_less_than_threshold(CONCEDE_AT, values_cache, values_cache_ptr) and game.current_player != game.get_winner():
                 game.game_over = True
-
 
         values_cache_ptr = (values_cache_ptr + 1) % (BAD_VALUES_COUNT * 2)
         game.apply_delta(best_node.delta_game)
@@ -276,38 +251,4 @@ def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = Non
         game.print_score()
 
     return history, game
-
-
-def generate_self_play_games(
-        games_to_generate: int,
-        rl_agent: MCTS_Agent,
-        file_path: str, log: bool, write: bool):
-
-    start_time = time.time()
-
-    results = []
-
-    for index in range(games_to_generate):
-
-        text = f"ИГРА {index + 1}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
-
-        history, game = self_play(agent=rl_agent, extra_text=text, visualise=log)
-
-        game_data = process_game_history(
-            history=history,
-            final_board_state=game.board.current_state,
-            score=game.get_score(),
-            agent_name=rl_agent.network.name
-        )
-
-        samples = len(game_data['turn'])
-        if samples > 0 and write:
-            save_game_to_hdf5(file_path, game_data, generate_name())
-
-        results.append(game.get_winner())
-
-        rl_agent.flush()
-
-
-    return  results
 

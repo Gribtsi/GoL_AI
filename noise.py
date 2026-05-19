@@ -39,12 +39,15 @@ class DirichletNoiseConfig:
     def exploration_fraction(self) -> float:
         return self.epsilon
 
-    def get_noise(self, legal_mask: np.ndarray) -> np.ndarray:
+    def get_noise(self, legal_mask: np.ndarray, seed) -> np.ndarray:
         """
         Возвращает вектор шума длины legal_mask.shape[0].
         Нелегальные ходы получают 0.
         Легальные ходы получают распределение Dirichlet.
         """
+
+        rng = np.random.default_rng(seed)
+
         legal_mask = np.asarray(legal_mask)
         if legal_mask.ndim != 1:
             raise ValueError("legal_mask must be a 1D array")
@@ -58,9 +61,10 @@ class DirichletNoiseConfig:
         if legal_indices.size == 0:
             return noise
 
-        dirichlet = np.random.dirichlet(
+        dirichlet = rng.dirichlet(
             [self.alpha] * legal_indices.size
         ).astype(np.float32)
 
         noise[legal_indices] = dirichlet
         return noise
+

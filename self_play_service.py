@@ -7,17 +7,18 @@ import gc
 
 import argparse
 from datetime import datetime
+import numpy as np
 
 from addresses_config import MODEL_PROVIDER_ADDRESS, WRITER_ADDRESS, get_inference_service_address
 from board import Board
 from config import MAX_MOVES_PER_GAME, BLACK, WHITE, PROCESSES_PER_WORKER, symbols, EMPTY, MAX_KOMI, \
-    ENABLE_KOMI_BALANCING
+    ENABLE_KOMI_BALANCING, MAX_KOMI_BALANCING_DELTA, MIN_KOMI_BALANCING_DELTA
 from game_data_sender import GameDataSender
 from mcts_agent import MCTS_Agent
 from model_manager import ModelManager
 from random_network import PytorchAgentWrapper, ZMQNetworkClient
 from rl_agent import RLAgent
-from self_play import self_play, process_game_history
+from self_play import self_play, training_data_from_game
 
 
 
@@ -54,16 +55,20 @@ def run_worker(writer_address, process_id: int = 0):
         # 3. Генерируем 1 игру (Self-Play)
         start_time = time.time()
 
+        current_seed_base = np.random.randint(0, 1000000)
+        rl_agent.set_random_seed(current_seed_base)
+
         history, game = self_play(agent=rl_agent, visualise=False, komi_offset=current_komi_offset)
 
         interrupted = game.interrupted()
 
         # 4. Формируем данные
-        game_data = process_game_history(
+        game_data = training_data_from_game(
             history=history,
             final_board_state=game.board.current_state,
             score=game.get_score(),
-            agent_name=rl_agent.network.name
+            agent_name=rl_agent.network.name,
+            noise_seed=current_seed_base
         )
 
 
@@ -80,9 +85,9 @@ def run_worker(writer_address, process_id: int = 0):
 
         total = blacks + whites
         if ENABLE_KOMI_BALANCING and (total + draws) >= correction_period:
-            if blacks / total > threshold and current_komi_offset <= MAX_KOMI:
+            if blacks / total > threshold and current_komi_offset < MAX_KOMI_BALANCING_DELTA:
                 current_komi_offset += 1
-            elif whites / total > threshold and current_komi_offset >= -MAX_KOMI:
+            elif whites / total > threshold and current_komi_offset > MIN_KOMI_BALANCING_DELTA:
                 current_komi_offset -= 1
 
             blacks = 0

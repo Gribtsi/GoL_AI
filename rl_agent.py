@@ -5,7 +5,8 @@ import torch.nn.functional as F
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
 
-from config import BOARD_SIZE, IN_CHANNELS, CONV_CHANNELS, FEATURES, NUM_RES_BLOCKS
+from config import BOARD_SIZE, IN_CHANNELS, CONV_CHANNELS, FEATURES, NUM_RES_BLOCKS, possible_moves_total
+
 
 class ResBlock(nn.Module):
     """
@@ -49,7 +50,7 @@ class RLAgent(nn.Module):
             nn.BatchNorm2d(2),
             nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(2 * BOARD_SIZE * BOARD_SIZE, BOARD_SIZE * BOARD_SIZE * 2 + 1)
+            nn.Linear(2 * BOARD_SIZE * BOARD_SIZE, possible_moves_total)
         )
 
         # --- 3. Голова Оценки (Value Head) ---

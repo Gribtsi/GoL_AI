@@ -3,7 +3,8 @@ from typing import Tuple, Union
 import numpy as np
 
 from board import Board, get_opponent, DeltaBoard
-from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME, DRAW_AT_MAX_TURNS
+from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME, DRAW_AT_MAX_TURNS, \
+    BOARD_SIZE, board_size_sqr, pass_code, swap_code
 from move import encode_move
 
 
@@ -16,10 +17,9 @@ class DeltaGame:
         self.delta_board = DeltaBoard()
 
         self.is_pass = False
+        self.is_swap = False
 
         self.valid = False
-
-
 
 
 class Game:
@@ -56,6 +56,7 @@ class Game:
         self.game_over = False
 
         self.pass_history = np.zeros(MAX_MOVES_PER_GAME, dtype=np.bool_)
+        self.had_swap = False
 
         # Коми в пользу БЕЛЫХ
         self.komi = komi
@@ -80,10 +81,13 @@ class Game:
     def undo(self):
 
         if self.current_move <= 0:
-
             raise Exception("Trying to undo empty game!")
 
         last_pass = self.current_move > 0 and self.pass_history[self.current_move - 1]
+
+        if self.current_move - 1 == 1 and self.had_swap:
+            self.set_komi(-self.komi)
+            self.had_swap = False
 
         if not last_pass:
             self.board.undo()
@@ -94,6 +98,7 @@ class Game:
         self.game_over = False
 
         self.current_move -= 1
+
 
     def apply_delta(self, delta_game: DeltaGame):
 
@@ -108,6 +113,10 @@ class Game:
         self.current_player = get_opponent(self.current_player)
 
         self.pass_history[self.current_move] = delta_game.is_pass
+
+        self.had_swap = self.had_swap or delta_game.is_swap
+        if delta_game.is_swap:
+            self.set_komi(-self.komi)
 
         self.current_move += 1
 
@@ -130,18 +139,26 @@ class Game:
 
         self.pass_history.fill(0)
 
-        self.game_over =False
+        self.had_swap = False
+        self.game_over = False
 
         self.current_move = 0
 
     def get_legal_moves_mask(self) -> np.ndarray:
         if not self.has_mask:
             self.board.get_legal_moves_mask(self.current_player, self.legal_mask)
+
+
+            # Пас всегда легален
+            self.legal_mask[board_size_sqr * 2] = 1.0
+            # Свап легален на первый ход белых
+            self.legal_mask[board_size_sqr * 2 + 1] = self.current_move == 1
+
             self.has_mask = True
 
         return self.legal_mask
 
-    def is_valid_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, out_game: 'Game', out_delta: DeltaGame) -> bool:
+    def is_valid_move(self, encoded_move : int, color:int, out_game: 'Game', out_delta: DeltaGame) -> bool:
         """
         Проверить легальность хода с учетом правил игры.
 
@@ -157,30 +174,32 @@ class Game:
             return False
 
         # Проверка 2: По маске пробить
-        if self.get_legal_moves_mask()[encode_move(x, y, life_cycles, color, is_pass)] == 0:
+        if self.get_legal_moves_mask()[encoded_move] == 0:
             return False
 
         self.copy(out_game)
 
-        out_game.make_move(x,y,life_cycles,is_pass, out_delta)
-
+        out_game.make_move(encoded_move, out_delta)
 
         return True
 
-    def make_move(self, pos_x: int, pos_y: int, life_cycles: int, is_pass: bool, out: DeltaGame, validate = True) -> bool:
+    def make_move(self, encoded_move : int, out: DeltaGame, validate = True) -> bool:
 
-        if validate and self.get_legal_moves_mask()[encode_move(pos_x, pos_y, life_cycles, self.current_player, is_pass)] == 0:
+        if validate and self.get_legal_moves_mask()[encoded_move] == 0:
             out.valid = False
             return False
 
+        self.board.make_move(encoded_move, self.current_player, out.delta_board)
 
-
-
-        self.board.make_move(pos_x, pos_y, life_cycles, self.current_player, is_pass, out.delta_board)
-
-
+        is_pass = encoded_move == pass_code
+        is_swap = encoded_move == swap_code
 
         out.is_pass = is_pass
+        out.is_swap = is_swap
+
+        if is_swap:
+            self.set_komi(-self.komi)
+            self.had_swap = True
 
         self.pass_history[self.current_move] = is_pass
 
@@ -366,11 +385,13 @@ class Game:
         new_game.current_player = self.current_player
 
         np.copyto(new_game.pass_history, self.pass_history)
+        new_game.had_swap = self.had_swap
 
         new_game.current_move += self.current_move
 
         new_game.game_over = self.game_over
         new_game.winner = self.winner
+
         return new_game
 
     def copy(self, target:'Game'):
@@ -391,6 +412,7 @@ class Game:
         target.komi_norm = self.komi_norm
 
         np.copyto(target.pass_history, self.pass_history)
+        target.had_swap = self.had_swap
 
     def __repr__(self) -> str:
         """Строковое представление игры."""

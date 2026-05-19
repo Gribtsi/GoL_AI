@@ -135,14 +135,14 @@ class MCTSNode:
 
         return sum
 
-    def add_noise(self, noise_config: DirichletNoiseConfig, game_state: Game):
+    def add_noise(self, noise_config: DirichletNoiseConfig, game_state: Game, seed_base : int):
         if self.noise_added or noise_config is None:
             return
         self.noise_added = True
 
         legal_mask = game_state.get_legal_moves_mask()
 
-        noise = noise_config.get_noise(legal_mask)
+        noise = noise_config.get_noise(legal_mask, seed_base + game_state.current_move)
         frac = noise_config.exploration_fraction
 
         for action_idx in list(self.child_priors.keys()):
@@ -167,6 +167,9 @@ class MCTS_Agent:
     def has_network(self):
         return self.network is not None
 
+    def set_random_seed(self, seed : int):
+        self.random_seed_base = seed
+
     def __init__(self, network : NetworkBase = None, c_puct: float = C_PUCT,
                  temperature: float = 1.0, noise_config: DirichletNoiseConfig = None, **kwargs):
         """
@@ -181,7 +184,7 @@ class MCTS_Agent:
         self.initial_temperature = temperature
         self.temperature = temperature
 
-
+        self.random_seed_base = 42
 
         self.game_state : Game = Game()
 
@@ -193,7 +196,7 @@ class MCTS_Agent:
         if 'score_goal_factor' in kwargs:
             self.score_goal_factor = kwargs['score_goal_factor']
         else:
-            self.score_goal_factor = 0.2
+            self.score_goal_factor = 1
 
 
 
@@ -235,7 +238,7 @@ class MCTS_Agent:
         self.node_pool.append(node)
 
 
-    def search(self, root: MCTSNode = None, num_simulations: int = DEEP_DEPTH) -> Tuple[int,int,int,int,bool, np.ndarray, MCTSNode]:
+    def search(self, root: MCTSNode = None, num_simulations: int = DEEP_DEPTH) -> Tuple[int, np.ndarray, MCTSNode]:
         """
         Запустить MCTS поиск для текущего состояния игры.
 
@@ -268,7 +271,7 @@ class MCTS_Agent:
         self.root_player = self.game_state.current_player
 
         if self.root.is_expanded:
-            self.root.add_noise(self.noise_config, self.game_state)
+            self.root.add_noise(self.noise_config, self.game_state, self.random_seed_base)
 
         adjusted_simulations = num_simulations - self.root.visit_count
         # Выполняем num_simulations итераций MCTS
@@ -293,14 +296,14 @@ class MCTS_Agent:
             self._backpropagate(search_path, value)
 
         # Выбираем лучший ход на основе visit counts
-        x, y, life_cycle, color, is_pass, policy_distribution, best_node = self._select_action()
+        encoded_move, policy_distribution, best_node = self._select_action()
 
 
 
         #elapsed_time = time.time() - start_time
         #print(f"Время поиска лучшего хода search: {elapsed_time:.2f} сек")
 
-        return x, y, life_cycle, color, is_pass, policy_distribution, best_node
+        return encoded_move, policy_distribution, best_node
 
     def _select_child(self, node: MCTSNode) -> MCTSNode:
         """
@@ -335,20 +338,20 @@ class MCTS_Agent:
         # Если выбранный узел еще не создан - создаем его сейчас
         if best_action_idx not in node.children:
             # Декодируем действие
-            x, y, life_cycle, color, is_pass = decode_move(best_action_idx, self.game_state.current_player)
 
             child_node = self.node_pool.pop()
 
-            success = self.game_state.make_move(x,y,life_cycle,is_pass, child_node.delta_game, False)
+            success = self.game_state.make_move(best_action_idx, child_node.delta_game, False)
 
             #success = node.game_state.is_valid_move(x, y, life_cycle, color, is_pass, child_node.game_state)
 
             if not success:
                 # Это не должно происходить, если child_priors правильно заполнен
-                raise ValueError(f"Invalid move selected: {x}:{y}{' GoL' if life_cycle == 1 else ''}{' Pass' if is_pass else ''}")
+                x,y,life_cycle,is_pass,is_swap = decode_move(best_action_idx)
+                raise ValueError(f"Invalid move selected: {x}:{y}{' GoL' if life_cycle == 1 else ''}{' Pass' if is_pass else ''}{' Swap' if is_swap else ''}")
 
             child_node.parent = node
-            child_node.parent_action = (x, y, life_cycle, color, is_pass)
+            child_node.parent_action = (best_action_idx)
             child_node.prior_prob = node.child_priors[best_action_idx]
 
             node.children[best_action_idx] = child_node
@@ -399,7 +402,7 @@ class MCTS_Agent:
                 node.child_priors[action_idx] = masked_policy[action_idx]
 
         if node == self.root:
-            node.add_noise(self.noise_config, self.game_state)
+            node.add_noise(self.noise_config, self.game_state, self.random_seed_base)
 
         utility = raw_value
 
@@ -472,7 +475,7 @@ class MCTS_Agent:
             skips -= 1
 
 
-    def _select_action(self) -> Tuple[int,int,int,int,bool, np.ndarray, MCTSNode]:
+    def _select_action(self) -> Tuple[int, np.ndarray, MCTSNode]:
         """
         Выбрать финальное действие на основе visit counts корневых детей.
 
@@ -499,10 +502,9 @@ class MCTS_Agent:
         policy_distribution = visit_counts / np.sum(visit_counts) if np.sum(visit_counts) > 0 else visit_counts
 
         # Декодируем action в Move
-        x, y, life_cycle, color, is_pass = decode_move(action_idx, self.root_player)
         best_node = self.root.children[action_idx]
 
-        return x, y, life_cycle, color, is_pass, policy_distribution, best_node
+        return action_idx, policy_distribution, best_node
 
     def get_policy(self) -> np.ndarray:
         """

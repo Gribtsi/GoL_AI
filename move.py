@@ -2,7 +2,7 @@ from numba.experimental import jitclass
 from numba import int64, boolean, njit
 from typing import Dict, Any, Tuple
 
-from config import BOARD_SIZE, board_size_sqr
+from config import BOARD_SIZE, board_size_sqr, pass_code, swap_code
 
 
 def move_to_dict(x, y, life_cycles, color, is_pass) -> Dict[str, Any]:
@@ -36,7 +36,7 @@ def dict_to_move(data: Dict[str, Any]) -> Tuple[int,int,int,int,bool]:
 
 
 @njit
-def decode_move(action_idx: int, color: int) -> Tuple[int,int,int,int,bool]:
+def decode_move(action_idx: int) -> Tuple[int,int,int,bool, bool]:
     """
     Декодировать индекс действия в объект Move.
 
@@ -47,9 +47,11 @@ def decode_move(action_idx: int, color: int) -> Tuple[int,int,int,int,bool]:
     Returns:
         Объект Move
     """
-    if action_idx == board_size_sqr * 2:
+    if action_idx == pass_code:
         # Пас
-        return 0, 0, 0, color, True
+        return 0, 0, 0, True, False
+    elif action_idx == swap_code:
+        return 0,0,0, False, True
     else:
         # Обычный ход
         position_idx = action_idx % board_size_sqr
@@ -58,11 +60,11 @@ def decode_move(action_idx: int, color: int) -> Tuple[int,int,int,int,bool]:
         x = position_idx // BOARD_SIZE
         y = position_idx % BOARD_SIZE
 
-        return x, y, life_cycle, color, False
+        return x, y, life_cycle, False, False
 
 
 @njit
-def encode_move(x:int, y:int, life_cycles:int, color:int, is_pass:bool) -> int:
+def encode_move(x:int, y:int, life_cycles:int, is_pass:bool, is_swap : bool) -> int:
     """
     Кодировать Move в индекс действия.
 
@@ -73,7 +75,9 @@ def encode_move(x:int, y:int, life_cycles:int, color:int, is_pass:bool) -> int:
         Индекс действия (0-722)
     """
     if is_pass:
-        return BOARD_SIZE * BOARD_SIZE * 2
+        return pass_code
+    elif is_swap:
+        return swap_code
     else:
         position_idx = x * BOARD_SIZE + y
         return position_idx + life_cycles * BOARD_SIZE * BOARD_SIZE

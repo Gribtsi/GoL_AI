@@ -7,7 +7,7 @@ from numpy.random import random, uniform
 
 from addresses_config import get_inference_service_address
 from board import Board
-from config import BOARD_SIZE, BLACK, WHITE, board_size_sqr, IN_CHANNELS, NN_BATCH_SIZE
+from config import BOARD_SIZE, BLACK, WHITE, board_size_sqr, IN_CHANNELS, NN_BATCH_SIZE, possible_moves_total
 
 
 class NetworkBase:
@@ -82,7 +82,7 @@ class RandomNetwork(NetworkBase):
 
         #policy = np.ones(BOARD_SIZE * BOARD_SIZE * 2 + 1) / (BOARD_SIZE * BOARD_SIZE * 2 + 1)
 
-        action_space_size = BOARD_SIZE * BOARD_SIZE * 2 + 1
+        action_space_size = possible_moves_total
         dirichlet_alpha = 0.2
         policy = np.random.dirichlet([dirichlet_alpha] * action_space_size).astype(np.float32)
 

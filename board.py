@@ -1,9 +1,12 @@
 from typing import Tuple
 import numpy as np
+from IPython.terminal.shortcuts.filters import pass_through
 from numba import njit
 
 from config import BOARD_SIZE, board_size_sqr, EMPTY, BLACK, WHITE, NN_HISTORY, MAX_HISTORY, STATES_TO_NN, IN_CHANNELS, \
-    symbols, possible_moves_total
+    symbols, possible_moves_total, pass_code
+from move import decode_move
+
 
 @njit
 def is_valid_position(x: int, y: int) -> bool:
@@ -279,6 +282,9 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
 @njit
 def get_opponent(color: int) -> int:
     """Получить цвет оппонента."""
+    if color == EMPTY:
+        return EMPTY
+
     return WHITE if color == BLACK else BLACK
 
 def generate_zobrist_table() -> np.ndarray:
@@ -421,6 +427,12 @@ def position_permissions_numba(
     return True, True
 
 @njit
+def swap_colours(current_state: np.ndarray, out: np.ndarray):
+    for x in range(BOARD_SIZE):
+        for y in range(BOARD_SIZE):
+            out[x,y] = get_opponent(current_state[x,y])
+
+@njit
 def get_legal_moves_mask_numba(
         current_state: np.ndarray,
         history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
@@ -459,8 +471,7 @@ def get_legal_moves_mask_numba(
             else:
                 out[idx_with_life] = 0
 
-    # Пас всегда легален
-    out[BOARD_SIZE * BOARD_SIZE * 2] = 1.0
+
 
 
 class DeltaBoard:
@@ -664,7 +675,7 @@ class Board:
                                           current_player, out, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
                                           self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
 
-    def make_move(self, x:int, y:int, life_cycles:int, color:int, is_pass:bool, out: DeltaBoard) -> (bool, str):
+    def make_move(self,encoded_move : int, color:int, out: DeltaBoard) -> (bool, str):
         """
         Применить ход на доске.
         НЕ ПРОВЕРЯЕТ ХОД. ПРОВЕРКА ОТДЕЛЬНО
@@ -678,22 +689,34 @@ class Board:
             True если ход легален и применен, False если отклонен
         """
         # Обработка паса
+
+        x,y,life_cycles,is_pass,is_swap = decode_move(encoded_move)
+
+        is_pass = encoded_move == pass_code
         if is_pass:
             # Пас не меняет доску, просто переключаем игрока
             out.valid = False
             return True, "Pass"
 
-        np.copyto(self.future_state_1, self.current_state)
-        self.future_state_1[x,y] = color
+        if not is_swap:
+            np.copyto(self.future_state_1, self.current_state)
+            self.future_state_1[x,y] = color
 
-        any_capture = check_captures_local(x,y, self.future_state_1, self.temp_marked_for_death, self.temp_visited, self.temp_group_array)
-        if any_capture:
-            remove_captured_stones(self.future_state_1, self.temp_marked_for_death, exclude_color=color)
+            any_capture = check_captures_local(x,y, self.future_state_1, self.temp_marked_for_death, self.temp_visited, self.temp_group_array)
+            if any_capture:
+                remove_captured_stones(self.future_state_1, self.temp_marked_for_death, exclude_color=color)
 
-        if life_cycles == 1:
-            game_of_life_with_captures(self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array, color)
+            if life_cycles == 1:
+                game_of_life_with_captures(self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array, color)
+            else:
+                np.copyto(self.future_state_2, self.future_state_1)
+
+            result = "Success"
         else:
+            swap_colours(self.current_state, self.future_state_1)
             np.copyto(self.future_state_2, self.future_state_1)
+
+            result = "Swap"
 
 
 
@@ -712,7 +735,7 @@ class Board:
 
         out.valid = True
 
-        return True, "Success"
+        return True, result
 
 
     def __repr__(self) -> str:
