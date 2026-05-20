@@ -1,12 +1,16 @@
-from typing import Tuple
+from typing import Tuple, Union
 import numpy as np
 from IPython.terminal.shortcuts.filters import pass_through
 from numba import njit
+from pydantic.v1 import NoneIsAllowedError
 
 from config import BOARD_SIZE, board_size_sqr, EMPTY, BLACK, WHITE, NN_HISTORY, MAX_HISTORY, STATES_TO_NN, IN_CHANNELS, \
     symbols, possible_moves_total, pass_code
 from move import decode_move
 
+
+LAZY_PERMIT = 1
+PRECIESE_PERMIT = 2
 
 @njit
 def is_valid_position(x: int, y: int) -> bool:
@@ -362,6 +366,48 @@ def check_superko_numba(state_hash: np.ndarray, hash_history: np.ndarray, count:
             return False
     return True
 
+@njit
+def placement_permission_numba(current_state: np.ndarray,
+        history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
+        hash_count: int,  # Текущее количество хешей в буфере
+        zobrist_table: np.ndarray,  # Таблица для вычисления хешей
+        current_player: int,
+        x: int, y: int,
+        future_state_1 : np.ndarray,
+
+        visited: np.ndarray,
+        marked_for_death:np.ndarray,
+        group_array:np.ndarray,
+
+        zobrist_hash1 :np.ndarray):
+
+    if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
+        return False
+
+    if current_state[x, y] != EMPTY:
+        return False
+
+    future_state_1[:] = current_state
+
+    future_state_1[x, y] = current_player
+
+    any_capture = check_captures_local(x, y, future_state_1, marked_for_death, visited, group_array)
+    if any_capture:
+        remove_captured_stones(future_state_1, marked_for_death, current_player)
+
+    # Проверка на самоубийственный ход (используем распаковку 3 значений из новой версии функции)
+    visited.fill(0)
+    size, liberties = find_group_and_liberties(x, y, future_state_1, group_array, visited)
+    if (liberties == 0) and (size > 0):
+        return False
+
+    # Проверка правила Суперко (Зобристово хеширование)
+    compute_zobrist_hash_numba(future_state_1, zobrist_table, zobrist_hash1)
+    if not check_superko_numba(zobrist_hash1, history_hashes, hash_count):
+        return False
+
+    return True
+
 @njit(cache=True)
 def position_permissions_numba(
         current_state: np.ndarray,
@@ -461,17 +507,34 @@ def get_legal_moves_mask_numba(
 
             idx_no_life = x * BOARD_SIZE + y
             if placement:
-                out[idx_no_life] = 1
+                out[idx_no_life] = 1.0
             else:
                 out[idx_no_life] = 0
 
-            idx_with_life = BOARD_SIZE * BOARD_SIZE + (x * BOARD_SIZE + y)
+            idx_with_life = board_size_sqr + idx_no_life
             if gol:
-                out[idx_with_life] = 1
+                out[idx_with_life] = 1.0
             else:
                 out[idx_with_life] = 0
 
 
+#Истина, если клетка пустая
+@njit
+def get_legal_moves_mask_lazy_numba(current_state: np.ndarray, out: np.ndarray):
+    for x in range(BOARD_SIZE):
+        for y in range(BOARD_SIZE):
+
+            empty = current_state[x,y] == EMPTY
+
+            idx_no_life = x * BOARD_SIZE + y
+            idx_with_life = board_size_sqr + idx_no_life
+
+            if empty:
+                out[idx_no_life] = LAZY_PERMIT
+                out[idx_with_life] = LAZY_PERMIT
+            else:
+                out[idx_no_life] = 0
+                out[idx_with_life] = 0
 
 
 class DeltaBoard:
@@ -511,8 +574,6 @@ class Board:
             Board.cached_zobrist_table = self.zobrist_table
         else:
             self.zobrist_table = Board.cached_zobrist_table
-
-
 
         self.history_ptr = 0
         self.history_hash_ptr = 0
@@ -594,10 +655,17 @@ class Board:
 
         np.copyto(self.current_state, self.history_stack[self.history_ptr])
 
+    #Воркер спавнит процессы форком - чтобы все нумба методы скомпилились 1 раз на все процессы
     def compile(self):
         temp_res = np.zeros(possible_moves_total, dtype=np.bool_)
         get_legal_moves_mask_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table, BLACK, temp_res, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array,
                                    self.temp_hash_1, self.temp_hash_2)
+        get_legal_moves_mask_lazy_numba(self.current_state, temp_res)
+        placement_permission_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
+                                   BLACK, 0, 0, self.future_state_1, self.future_state_2, self.temp_visited,
+                                   self.temp_marked_for_death,
+                                   self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
+
         get_opponent(BLACK)
         get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x, self.temp_queue_y)
 
@@ -670,12 +738,33 @@ class Board:
         self.inc_ptr()
         self.inc_hash_ptr()
 
+    def get_legal_moves_mask_lazy(self, out: np.ndarray):
+        return get_legal_moves_mask_lazy_numba(self.current_state, out)
+
+
     def get_legal_moves_mask(self, current_player: int, out: np.ndarray):
         return get_legal_moves_mask_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
                                           current_player, out, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
                                           self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
 
-    def make_move(self,encoded_move : int, color:int, out: DeltaBoard) -> (bool, str):
+    def is_move_legal(self, current_player: int, x:int, y:int, gol:int) -> Tuple[Union[bool, None], Union[bool, None]]:
+
+        if gol == 0:
+            return placement_permission_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
+                                          current_player, x, y, self.future_state_1, self.temp_visited, self.temp_marked_for_death,
+                                          self.temp_group_array, self.temp_hash_1), None
+        elif gol == 1:
+            placement, gol = position_permissions_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
+                                          current_player, x,y, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
+                                          self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
+            return placement, gol
+
+        else:
+            return None, None
+
+
+
+    def make_move(self, encoded_move : int, color:int, out: DeltaBoard) -> (bool, str):
         """
         Применить ход на доске.
         НЕ ПРОВЕРЯЕТ ХОД. ПРОВЕРКА ОТДЕЛЬНО
@@ -758,7 +847,7 @@ class Board:
 
         return "\n".join(lines)
 
-    def board_with_permissions_as_text(self, current_player : int, mask: np.ndarray) -> str:
+    def board_with_permissions_as_text(self, mask: np.ndarray) -> str:
         """
         Визуализировать текущее состояние доски с эмодзи.
         """
@@ -772,8 +861,11 @@ class Board:
                 if self.current_state[x,y] != EMPTY:
                     row_str += symbols[self.current_state[x, y]] + ""
                 else:
-                    stone, gol = mask[x * BOARD_SIZE + y], mask[board_size_sqr + x * BOARD_SIZE + y]
+                    stone, gol = mask[x * BOARD_SIZE + y] > 0, mask[board_size_sqr + x * BOARD_SIZE + y] > 0
+
+
                     res = EMPTY + (100 if stone and gol else 0) + (10 if stone and not gol else 0)
+
                     row_str += symbols[res] + ""
 
 
@@ -825,16 +917,18 @@ class Board:
 
 
     def fast_territories(self) -> Tuple[int, int]:
+
+
         get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x,
                         self.temp_queue_y)
 
         np.equal(self.future_state_1, BLACK, out=self.temp_visited)
-        black_territory = 0 + np.count_nonzero(self.temp_visited)
+        territory_black = 0 + np.count_nonzero(self.temp_visited)
 
         np.equal(self.future_state_1, WHITE, out=self.temp_visited)
-        white_territory = 0 + np.count_nonzero(self.temp_visited)
+        territory_white = 0 + np.count_nonzero(self.temp_visited)
 
-        return black_territory, white_territory
+        return territory_black, territory_white
 
 
     def update_network_input(self, current_player_color: int, komi: float) -> None:

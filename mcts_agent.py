@@ -1,7 +1,8 @@
 import numpy as np
 import math
 from typing import List, Tuple
-from board import get_opponent
+
+from board import get_opponent, PRECIESE_PERMIT
 from config import BOARD_SIZE, board_size_sqr, possible_moves_total, DEEP_DEPTH, EMPTY, TEMP_DECAY_TURN, \
     TEMP_DECAY_COEFF, C_PUCT, SMALL_TEMP
 from move import decode_move
@@ -12,6 +13,7 @@ from noise import DirichletNoiseConfig
 from random_network import NetworkBase
 
 _SCORES_ARRAY = np.arange(-board_size_sqr, board_size_sqr + 1, dtype=np.float32)
+
 def get_expected_score(score_logits: np.ndarray) -> float:
     """
     Вычисляет математическое ожидание счета на чистом NumPy (zero-allocation для массива очков).
@@ -105,6 +107,8 @@ class MCTSNode:
         self.child_priors.clear()
         self.children.clear()
 
+        self.delta_game.next_mask.fill(0)
+
         self.expected_score = 0
         self.is_expanded = False
         self.noise_added = False
@@ -140,9 +144,10 @@ class MCTSNode:
             return
         self.noise_added = True
 
-        legal_mask = game_state.get_legal_moves_mask()
+        mask = np.zeros(possible_moves_total, dtype=np.float32)
+        game_state.get_legal_moves_mask_preciese(mask)
 
-        noise = noise_config.get_noise(legal_mask, seed_base + game_state.current_move)
+        noise = noise_config.get_noise(mask, seed_base + game_state.current_move)
         frac = noise_config.exploration_fraction
 
         for action_idx in list(self.child_priors.keys()):
@@ -198,7 +203,9 @@ class MCTS_Agent:
         else:
             self.score_goal_factor = 1
 
-
+        self.ucb_scores_cache = np.zeros(possible_moves_total, dtype=np.float32)
+        self.legal_mask_cache = np.zeros(possible_moves_total, dtype=np.float32)
+        self.masked_policy_cache = np.zeros(possible_moves_total, dtype=np.float32)
 
         self.node_pool = []
         for i in range(DEEP_DEPTH + 1):
@@ -260,6 +267,9 @@ class MCTS_Agent:
             self.root = self.node_pool.pop()
             self.game_state.clear()
             self.first_root = self.root
+
+            self.game_state.update_legal_moves_mask()
+            np.copyto(self.root.delta_game.next_mask, self.game_state.legal_mask)
         else:
             self.set_new_root(root)
 
@@ -312,11 +322,14 @@ class MCTS_Agent:
         Предполагаем, что self.game_state находится в узле node
 
         """
-        best_score = -float('inf')
-        best_action_idx = None
+
+        self.ucb_scores_cache.fill(-np.inf)
 
         # Вычисляем UCB для всех возможных действий (виртуальных и реальных)
         for action_idx, prior_prob in node.child_priors.items():
+
+            if prior_prob <= 0:
+                continue
 
             if action_idx in node.children:
                 # Реальный дочерний узел - используем его статистику
@@ -331,9 +344,29 @@ class MCTS_Agent:
                 # U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + 0)
                 ucb_score = self.c_puct * prior_prob * math.sqrt(node.visit_count + 1)
 
-            if ucb_score > best_score:
-                best_score = ucb_score
+            self.ucb_scores_cache[action_idx] = ucb_score
+
+        best_action_idx = None
+
+        while True:
+            # Находим индекс максимального элемента (O(N) на С)
+            action_idx = np.argmax(self.ucb_scores_cache)
+
+            # Если максимум -inf, кандидаты закончились
+            if self.ucb_scores_cache[action_idx] == -np.inf:
+                break
+
+            # Проверяем легальность
+            if self.game_state.is_valid_move(action_idx, node.delta_game.next_mask):
                 best_action_idx = action_idx
+                break
+            else:
+                # Маскируем нелегальный ход, чтобы argmax его больше не нашел
+                self.ucb_scores_cache[action_idx] = -np.inf
+                node.child_priors[action_idx] = -float('inf')
+
+        if best_action_idx is None:
+            raise ValueError(f"No valid moves in game!")
 
         # Если выбранный узел еще не создан - создаем его сейчас
         if best_action_idx not in node.children:
@@ -351,7 +384,7 @@ class MCTS_Agent:
                 raise ValueError(f"Invalid move selected: {x}:{y}{' GoL' if life_cycle == 1 else ''}{' Pass' if is_pass else ''}{' Swap' if is_swap else ''}")
 
             child_node.parent = node
-            child_node.parent_action = (best_action_idx)
+            child_node.parent_action = best_action_idx
             child_node.prior_prob = node.child_priors[best_action_idx]
 
             node.children[best_action_idx] = child_node
@@ -381,25 +414,25 @@ class MCTS_Agent:
         policy, raw_value, score = self.network.predict(state_tensor)
 
         # Получаем маску легальных ходов
-        legal_mask = self.game_state.get_legal_moves_mask()
+        self.game_state.get_legal_moves_mask_lazy(self.legal_mask_cache)
 
         # Применяем маску к policy (обнуляем нелегальные ходы)
-        masked_policy = policy * legal_mask
-
+        np.multiply(policy, self.legal_mask_cache, out=self.masked_policy_cache)
 
         # Нормализуем policy
-        policy_sum = np.sum(masked_policy)
+        policy_sum = np.sum(self.masked_policy_cache)
         if policy_sum > 0:
-            masked_policy = masked_policy / policy_sum
+            masked_policy = self.masked_policy_cache / policy_sum
         else:
             # Если все вероятности 0, делаем равномерное распределение по легальным ходам
-            masked_policy = legal_mask / np.sum(legal_mask)
+            np.copyto(self.masked_policy_cache, self.legal_mask_cache)
+            self.masked_policy_cache /= np.sum(self.masked_policy_cache)
 
         # ЛЕНИВОЕ СОЗДАНИЕ: Сохраняем только prior probabilities и future states
         # Физические узлы создадутся в _select_child при необходимости
         for action_idx in range(possible_moves_total):
-            if legal_mask[action_idx] > 0:
-                node.child_priors[action_idx] = masked_policy[action_idx]
+            if self.legal_mask_cache[action_idx] > 0:
+                node.child_priors[action_idx] = self.masked_policy_cache[action_idx]
 
         if node == self.root:
             node.add_noise(self.noise_config, self.game_state, self.random_seed_base)
@@ -471,8 +504,10 @@ class MCTS_Agent:
 
             if skips <= 0:
                 self.game_state.undo()
-
             skips -= 1
+
+        np.copyto(self.game_state.legal_mask, self.root.delta_game.next_mask)
+        self.game_state.has_mask = True
 
 
     def _select_action(self) -> Tuple[int, np.ndarray, MCTSNode]:
@@ -505,21 +540,3 @@ class MCTS_Agent:
         best_node = self.root.children[action_idx]
 
         return action_idx, policy_distribution, best_node
-
-    def get_policy(self) -> np.ndarray:
-        """
-        Получить распределение вероятностей действий после поиска (для обучения).
-
-        Returns:
-            Numpy массив (723,) с нормализованными visit counts
-        """
-        visit_counts = np.zeros(possible_moves_total, dtype=np.float32)
-
-        for action_idx, child in self.root.children.items():
-            visit_counts[action_idx] = child.visit_count
-
-        # Нормализуем
-        if np.sum(visit_counts) > 0:
-            return visit_counts / np.sum(visit_counts)
-        else:
-            return visit_counts

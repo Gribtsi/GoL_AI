@@ -22,6 +22,7 @@ symbols = {
     WHITE: '🔴',
     EMPTY + 10 : '❎',
     EMPTY + 100 : '🟩',
+    EMPTY + 200 : '🟨',
     EMPTY : '⬜',
 }
 DEEP_DEPTH = 400

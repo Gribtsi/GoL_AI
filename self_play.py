@@ -188,6 +188,8 @@ def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = Non
     else:
         till_the_end_str = ''
 
+    legal_mask = np.zeros(possible_moves_total, dtype=np.float32)
+
     while (game is not None) and (not game.game_over):
 
         started = time.time()
@@ -200,8 +202,8 @@ def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = Non
             print(f"ХОД {game.current_move + 1}{till_the_end_str} {[f'{values_cache[i]:.2f}' for i in range(values_cache_ptr-1, values_cache_ptr - 1 - BAD_VALUES_COUNT * 2, -1)]}")
             print(game.get_header_text())
             print("=" * 60)
-
-            print(game.board.board_with_permissions_as_text(game.current_player, game.get_legal_moves_mask()))
+            game.get_legal_moves_mask_preciese(legal_mask)
+            print(game.board.board_with_permissions_as_text(legal_mask))
 
 
         is_deep = (uniform(0, 1) <= deep_search_chance)
@@ -244,7 +246,9 @@ def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = Non
         print(f"Игра окончена за {game.current_move} ходов!")
         print(game.get_winner_text())
         print("=" * 60)
-        print(game.board.board_with_permissions_as_text(game.current_player, game.get_legal_moves_mask()))
+
+        game.get_legal_moves_mask_preciese(legal_mask)
+        print(game.board.board_with_permissions_as_text(legal_mask))
         print()
 
         # Подсчет очков

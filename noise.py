@@ -23,7 +23,7 @@ class DirichletNoiseConfig:
     @staticmethod
     def for_selfplay() -> 'DirichletNoiseConfig':
         """Конфигурация для self-play обучения (шум отключен)."""
-        return DirichletNoiseConfig(epsilon=0.25, alpha=0.15, enabled=True)
+        return DirichletNoiseConfig(epsilon=0.25, alpha=0.15, enabled=False)
 
     @staticmethod
     def for_tournament() -> 'DirichletNoiseConfig':
