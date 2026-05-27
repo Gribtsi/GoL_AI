@@ -10,9 +10,11 @@ import tempfile
 import multiprocessing as mp
 import torch
 
+import collections, statistics
+
 from addresses_config import MODEL_PROVIDER_ADDRESS, get_inference_service_address
 from config import INFERENCE_TIMEOUT_MS, DEEP_DEPTH, SHALLOW_DEPTH, DEEP_SEARCH_CHANCE, MAX_MOVES_PER_GAME, \
-    INFERENCE_SERVICES_COUNT, NN_BATCH_SIZE
+    INFERENCE_SERVICES_COUNT, NN_BATCH_SIZE, OBS_SHAPE
 from model_manager import ModelManager
 from random_network import BatchedPytorchAgentWrapper
 from rl_agent import RLAgent
@@ -28,7 +30,6 @@ class ModelClient:
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.socket = self._create_socket()
-
     def _create_socket(self):
         """Создает новый сокет REQ с таймаутом на чтение."""
         socket = self.context.socket(zmq.REQ)
@@ -88,11 +89,14 @@ class ModelClient:
         return model_name, True
 
 class ZMQInferenceServer:
-    def __init__(self, timeout_ms=INFERENCE_TIMEOUT_MS, process_id = 0, device = 'cuda'):
+    def __init__(self, timeout_ms=INFERENCE_TIMEOUT_MS, process_id = 0, write_statistics = False, device = 'cuda'):
 
         self.process_id = process_id
+        self.write_statistics = write_statistics
+
         self.device = device
         self.timeout_ms = timeout_ms
+
         self.max_batch_size = NN_BATCH_SIZE
 
         self.check_for_updates_interval = 10
@@ -143,11 +147,6 @@ class ZMQInferenceServer:
         self.model_client = ModelClient(save_dir=process_model_dir)
         self.model_manager = ModelManager(RLAgent, save_dir=process_model_dir, device=self.device)
 
-
-        cache_root = tempfile.gettempdir()
-        os.environ["TRITON_CACHE_DIR"] = f"{cache_root}/triton_cache/p{self.process_id}"
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{cache_root}/torchinductor_cache/p{self.process_id}"
-
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
         os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
 
@@ -180,53 +179,87 @@ class ZMQInferenceServer:
 
         print(f"Получена модель {self.current_model_version}")
 
+        batch_sizes = collections.deque(maxlen=1000)
+        gpu_times = collections.deque(maxlen=1000)
+        wait_times = collections.deque(maxlen=1000)
+        recv_times = collections.deque(maxlen=1000)
+        send_times = collections.deque(maxlen = 1000)
+
+
+        statistics_per = 1000
+        current = 0
+
         while True:
             identities = []
             empty_frames = []
             actual_batch_size = 0
+            t_cycle_start = time.time()
 
-            # 1. Ждем первый запрос (блокирующе, без таймаута)
-            socks = dict(self.poller.poll(timeout=None))
-            if self.socket in socks:
-                req = self.socket.recv_multipart()
-                identities.append(req[0])
-                empty_frames.append(req[1])
-                # Сразу записываем в pinned память по нулевому индексу
-                self.model.add_input(actual_batch_size, pickle.loads(req[2]))
+            # Блокирующий wait на первый запрос
+            self.poller.poll(timeout=None)
+            req = self.socket.recv_multipart(copy=False)
+            identities.append(bytes(req[0]))
+            empty_frames.append(bytes(req[1]))
+            self.model.add_input(0, np.frombuffer(req[2].buffer, dtype=np.float32).reshape(OBS_SHAPE))
+            actual_batch_size += 1
+
+            # Жадный вычит без ожидания
+            while actual_batch_size < self.max_batch_size:
+                if not self.poller.poll(timeout=0):
+                    break
+                req = self.socket.recv_multipart(copy=False)
+                identities.append(bytes(req[0]))
+                empty_frames.append(bytes(req[1]))
+                self.model.add_input(actual_batch_size,
+                                     np.frombuffer(req[2].buffer, dtype=np.float32).reshape(OBS_SHAPE))
                 actual_batch_size += 1
 
-            # 2. Собираем остальные запросы в окно таймаута
-            start_time = time.time()
-            while actual_batch_size < self.max_batch_size:
-                elapsed_ms = (time.time() - start_time) * 1000
-                remaining_time = max(0, self.timeout_ms - elapsed_ms)
-
-                if remaining_time <= 0:
-                    break
-
-                socks = dict(self.poller.poll(timeout=remaining_time))
-                if self.socket in socks:
-                    req = self.socket.recv_multipart()
-                    identities.append(req[0])
-                    empty_frames.append(req[1])
-
-                    self.model.add_input(actual_batch_size, pickle.loads(req[2]))
+            # Добор с таймаутом если нужен
+            if actual_batch_size < self.max_batch_size:
+                start_wait = time.time()
+                while actual_batch_size < self.max_batch_size:
+                    remaining_time = max(0, self.timeout_ms - (time.time() - start_wait) * 1000)
+                    if remaining_time <= 0 or not self.poller.poll(timeout=remaining_time):
+                        break
+                    req = self.socket.recv_multipart(copy=False)
+                    identities.append(bytes(req[0]))
+                    empty_frames.append(bytes(req[1]))
+                    self.model.add_input(actual_batch_size,
+                                         np.frombuffer(req[2].buffer, dtype=np.float32).reshape(OBS_SHAPE))
                     actual_batch_size += 1
-                else:
-                    break
 
-            # 3. Делаем 1 прямой проход на собранном батче
+            recv_times.append(time.time() - t_cycle_start)
+
+            t_gpu = time.time()
             policies, values, scores = self.model.predict(actual_batch_size)
+            gpu_times.append(time.time() - t_gpu)
+            batch_sizes.append(actual_batch_size)
 
-            # 4. Рассылаем результаты воркерам
+            t_send = time.time()
+            name_bytes = self.current_model_version.encode('utf-8')
             for i in range(actual_batch_size):
-                # Приводим к форматам, которые ожидает клиент (MCTS)
-                # policy_probabilities[i] уже np.ndarray, score_numpy тоже.
-                result = (policies[i], np.float32(values[i]), scores[i], self.current_model_version)
-                reply_payload = pickle.dumps(result)
+                self.socket.send_multipart([
+                    identities[i], empty_frames[i],
+                    policies[i].astype(np.float32).tobytes(),
+                    np.array([values[i]], dtype=np.float32).tobytes(),
+                    scores[i].astype(np.float32).tobytes(),
+                    name_bytes,
+                ], copy=False)
+            send_times.append(time.time() - t_send)
 
-                self.socket.send_multipart([identities[i], empty_frames[i], reply_payload])
+            wait_times.append(time.time() - t_cycle_start)
 
+            current += 1
+            if statistics_per <= current:
+
+                if self.write_statistics:
+                    print(f"Avg batch: {statistics.mean(batch_sizes):.1f}/{self.max_batch_size} "
+                          f"| GPU: {statistics.mean(gpu_times) * 1000:.1f}ms "
+                          f"| Fill: {statistics.mean(batch_sizes) / self.max_batch_size:.0%} "
+                          f"| Avg time: {statistics.mean(wait_times) * 1000:.1f}ms "
+                          f"| Avg recv time: {statistics.mean(recv_times) * 1000:.1f}ms "
+                          f"| Avg send time: {statistics.mean(send_times) * 1000:.1f}ms ")
+                current = 0
 
             if time.time() > self.last_update_time + self.check_for_updates_interval:
                 self.check_for_updates()
@@ -237,13 +270,21 @@ if __name__ == "__main__":
     mp.set_start_method('fork')
     gc.freeze()
 
+    cache_root = tempfile.gettempdir()
 
     processes = []
     for i in range(INFERENCE_SERVICES_COUNT):
-        service = ZMQInferenceServer(process_id=i)
+        # Устанавливаем переменные ДО fork, чтобы процесс их унаследовал
+        os.environ["TRITON_CACHE_DIR"] = f"{cache_root}/triton_cache/p{i}"
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{cache_root}/torchinductor_cache/p{i}"
+        os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+        os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
+
+        service = ZMQInferenceServer(process_id=i, write_statistics=i == 0)
         p = mp.Process(target=service.run)
         p.start()
         processes.append(p)
+
 
     for p in processes:
         p.join()

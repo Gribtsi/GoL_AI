@@ -17,9 +17,7 @@ from game_data_sender import GameDataSender
 from mcts_agent import MCTS_Agent
 from model_manager import ModelManager
 from random_network import PytorchAgentWrapper, ZMQNetworkClient
-from rl_agent import RLAgent
-from self_play import self_play, training_data_from_game
-
+from self_play import self_play, training_data_from_game, game_log_from_game
 
 
 def run_worker(writer_address, process_id: int = 0):
@@ -39,6 +37,8 @@ def run_worker(writer_address, process_id: int = 0):
     rl_agent = MCTS_Agent(temperature=1.0)
     rl_agent.set_network(wrapper)
 
+    rng = np.random.default_rng()
+
     index = 0
 
     whites, blacks, draws = 0,0,0
@@ -55,7 +55,8 @@ def run_worker(writer_address, process_id: int = 0):
         # 3. Генерируем 1 игру (Self-Play)
         start_time = time.time()
 
-        current_seed_base = np.random.randint(0, 1000000)
+        current_seed_base = int(rng.integers(0, 2**30)) #Чтобы вместить модификацию сида текущим ходом
+
         rl_agent.set_random_seed(current_seed_base)
 
         history, game = self_play(agent=rl_agent, visualise=False, komi_offset=current_komi_offset)
@@ -98,6 +99,12 @@ def run_worker(writer_address, process_id: int = 0):
         # 5. Отправляем писателю
         game_id = f"game_{index:05d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         sender.send_game(game_id, game_data)
+
+        game_log = game_log_from_game(
+            history=history,
+            result=game.get_score(),
+            agent_name=rl_agent.network.name)
+        sender.send_game_log(game_id, game_log)
 
         # 6. Очистка памяти агента (zero-allocation возврат нод в пул)
         rl_agent.flush()

@@ -1,8 +1,6 @@
 from typing import Tuple, Union
 import numpy as np
-from IPython.terminal.shortcuts.filters import pass_through
 from numba import njit
-from pydantic.v1 import NoneIsAllowedError
 
 from config import BOARD_SIZE, board_size_sqr, EMPTY, BLACK, WHITE, NN_HISTORY, MAX_HISTORY, STATES_TO_NN, IN_CHANNELS, \
     symbols, possible_moves_total, pass_code
@@ -662,9 +660,9 @@ class Board:
                                    self.temp_hash_1, self.temp_hash_2)
         get_legal_moves_mask_lazy_numba(self.current_state, temp_res)
         placement_permission_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
-                                   BLACK, 0, 0, self.future_state_1, self.future_state_2, self.temp_visited,
+                                   BLACK, 0, 0, self.future_state_1, self.temp_visited,
                                    self.temp_marked_for_death,
-                                   self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
+                                   self.temp_group_array, self.temp_hash_1)
 
         get_opponent(BLACK)
         get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x, self.temp_queue_y)

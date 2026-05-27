@@ -1,5 +1,7 @@
 import numpy as np
 
+from config import possible_moves_total
+
 
 class DirichletNoiseConfig:
     """
@@ -22,8 +24,8 @@ class DirichletNoiseConfig:
 
     @staticmethod
     def for_selfplay() -> 'DirichletNoiseConfig':
-        """Конфигурация для self-play обучения (шум отключен)."""
-        return DirichletNoiseConfig(epsilon=0.25, alpha=0.15, enabled=False)
+        """Конфигурация для self-play обучения"""
+        return DirichletNoiseConfig(epsilon=0.25, alpha=0.15, enabled=True)
 
     @staticmethod
     def for_tournament() -> 'DirichletNoiseConfig':
@@ -39,32 +41,12 @@ class DirichletNoiseConfig:
     def exploration_fraction(self) -> float:
         return self.epsilon
 
-    def get_noise(self, legal_mask: np.ndarray, seed) -> np.ndarray:
-        """
-        Возвращает вектор шума длины legal_mask.shape[0].
-        Нелегальные ходы получают 0.
-        Легальные ходы получают распределение Dirichlet.
-        """
-
-        rng = np.random.default_rng(seed)
-
-        legal_mask = np.asarray(legal_mask)
-        if legal_mask.ndim != 1:
-            raise ValueError("legal_mask must be a 1D array")
-
-        noise = np.zeros_like(legal_mask, dtype=np.float32)
+    def get_noise(self, rng: np.random.Generator, dim: int) -> np.ndarray:
 
         if not self.enabled:
-            return noise
-
-        legal_indices = np.flatnonzero(legal_mask > 0)
-        if legal_indices.size == 0:
-            return noise
+            return np.zeros(dim, dtype=np.float32)
 
         dirichlet = rng.dirichlet(
-            [self.alpha] * legal_indices.size
+            [self.alpha] * dim
         ).astype(np.float32)
-
-        noise[legal_indices] = dirichlet
-        return noise
-
+        return dirichlet

@@ -1,15 +1,10 @@
 from typing import Tuple, Union
 
-from fontTools.ttLib.tables.V_O_R_G_ import VOriginRecord
-from numba import njit
-
 import numpy as np
-from sympy.solvers.polysys import factor_system_bool
-from torchvision.transforms.v2.functional import elastic_mask, resize
 
 from board import Board, get_opponent, DeltaBoard, LAZY_PERMIT, PRECIESE_PERMIT
 from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME, DRAW_AT_MAX_TURNS, \
-    BOARD_SIZE, board_size_sqr, pass_code, swap_code
+    BOARD_SIZE, board_size_sqr, pass_code, swap_code, ALLOW_SWAP_AT_TURN_1
 from move import encode_move, decode_move
 
 
@@ -149,14 +144,17 @@ class Game:
 
         self.current_move = 0
 
+    def can_swap(self):
+        return True if self.current_move == 1 and ALLOW_SWAP_AT_TURN_1 else False
+
     def update_legal_moves_mask(self):
         if not self.has_mask:
 
             self.board.get_legal_moves_mask_lazy(self.legal_mask)
             # Пас всегда легален
-            self.legal_mask[board_size_sqr * 2] = PRECIESE_PERMIT
+            self.legal_mask[pass_code] = PRECIESE_PERMIT
             # Свап легален на первый ход белых
-            self.legal_mask[board_size_sqr * 2 + 1] = PRECIESE_PERMIT if self.current_move == 1 else 0
+            self.legal_mask[swap_code] = PRECIESE_PERMIT if self.can_swap() else 0
 
             self.has_mask = True
 
@@ -171,9 +169,9 @@ class Game:
         self.board.get_legal_moves_mask(self.current_player, out)
 
         # Пас всегда легален
-        out[board_size_sqr * 2] = 1.0
+        out[pass_code] = 1.0
         # Свап легален на первый ход белых
-        out[board_size_sqr * 2 + 1] = 1.0 if self.current_move == 1 else 0.0
+        out[swap_code] = 1.0 if self.can_swap() else 0.0
 
 
     def is_valid_move(self, encoded_move : int, out_mask : np.ndarray) -> bool:
@@ -395,7 +393,10 @@ class Game:
 
         return "\n".join(lines)
 
-    def get_board_text(self, mask:np.ndarray):
+    def get_board_text(self):
+        mask = np.zeros(possible_moves_total, dtype=np.float32)
+        self.get_legal_moves_mask_preciese(mask)
+
         return self.board.board_with_permissions_as_text(mask)
 
     def print_score(self):

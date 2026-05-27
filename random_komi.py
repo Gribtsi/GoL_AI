@@ -2,9 +2,10 @@ from typing import Tuple
 from numba import njit
 import numpy as np
 
-from config import MAX_KOMI, FLAT_RANDOM_KOMI_CHANCE, MEAN_KOMI, KOMI_STD_DEV
+from config import MAX_KOMI, FLAT_RANDOM_KOMI_CHANCE, MEAN_KOMI, KOMI_STD_DEV, ADD_HALF_POINT, RANDOMISE_KOMI
 
-_POSSIBLE_VALUES = np.arange(-MAX_KOMI + 0.5, MAX_KOMI, 1.0)
+offset = 0.5 if ADD_HALF_POINT else 0.0
+_POSSIBLE_VALUES = np.arange(-MAX_KOMI + offset, MAX_KOMI + 1 - offset, 1.0)
 
 _PROBS = np.exp(-0.5 * ((_POSSIBLE_VALUES - MEAN_KOMI) / KOMI_STD_DEV) ** 2)
 _PROBS /= np.sum(_PROBS)
@@ -18,7 +19,8 @@ def _generate_komi_njit(
         possible_values: np.ndarray,
         cdf: np.ndarray,
         flat_chance: float,
-        komi_offset : float
+        komi_offset : float,
+        rng: np.random.Generator
 ) -> Tuple[float, bool]:
     # 1. Плоское распределение
     if np.random.random() < flat_chance:
@@ -35,7 +37,7 @@ def _generate_komi_njit(
         return val, True
 
     # 2. Нормальное распределение (через CDF)
-    r = np.random.random()
+    r = rng.random()
     # searchsorted за O(log N) находит индекс, где вероятность попадает в нужный интервал
     idx = np.searchsorted(cdf, r)
 
@@ -50,10 +52,14 @@ def _generate_komi_njit(
 
 
 # === 4. Обертка с нужной вам сигнатурой ===
-def generate_komi(komi_offset : float = 0) -> Tuple[float, bool]:
+def generate_komi(komi_offset : float, rng: np.random.Generator) -> Tuple[float, bool]:
     """
     Генерирует коми. С вероятностью flat_chance выбирает равномерно из всего диапазона,
     иначе использует нормальное распределение вокруг mean_komi.
     """
     # Просто передаем заранее высчитанные глобальные массивы в njit-метод
-    return _generate_komi_njit(_POSSIBLE_VALUES, _CDF, FLAT_RANDOM_KOMI_CHANCE, komi_offset)
+
+    if RANDOMISE_KOMI:
+        return _generate_komi_njit(_POSSIBLE_VALUES, _CDF, FLAT_RANDOM_KOMI_CHANCE, komi_offset, rng)
+    else:
+        return MEAN_KOMI, False

@@ -6,8 +6,6 @@ import msgpack
 import msgpack_numpy as m
 import os
 
-from numpy.conftest import dtype
-
 from config import IN_CHANNELS, BOARD_SIZE, possible_moves_total, BLACK, WHITE, DEEP_SEARCH_CHANCE
 
 m.patch()
@@ -363,7 +361,7 @@ def game_data_writer_service():
                         new_total = total_samples + added_samples
                         agent_samples += added_samples
 
-                        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid]:
+                        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_noise_seed, d_gameid]:
                             dset.resize((new_total,) + dset.shape[1:])
 
                         d_state[total_samples:new_total] = payload['state_tensor']

@@ -2,7 +2,6 @@ import numpy as np
 import math
 from typing import List, Tuple
 
-from board import get_opponent, PRECIESE_PERMIT
 from config import BOARD_SIZE, board_size_sqr, possible_moves_total, DEEP_DEPTH, EMPTY, TEMP_DECAY_TURN, \
     TEMP_DECAY_COEFF, C_PUCT, SMALL_TEMP
 from move import decode_move
@@ -90,6 +89,7 @@ class MCTSNode:
 
         self.is_terminal = False
 
+
     def reset(self):
 
         self.parent = None
@@ -139,24 +139,33 @@ class MCTSNode:
 
         return sum
 
-    def add_noise(self, noise_config: DirichletNoiseConfig, game_state: Game, seed_base : int):
+    def add_noise(self, noise_config: DirichletNoiseConfig, rng: np.random.Generator, random_seeed : int):
         if self.noise_added or noise_config is None:
             return
         self.noise_added = True
 
-        mask = np.zeros(possible_moves_total, dtype=np.float32)
-        game_state.get_legal_moves_mask_preciese(mask)
+        if not noise_config.enabled:
+            return
 
-        noise = noise_config.get_noise(mask, seed_base + game_state.current_move)
+        # Получаем индексы легальных ходов напрямую из маски (как ты предложил)
+        legal_actions = np.nonzero(self.delta_game.next_mask)[0]
+
+        if len(legal_actions) == 0:
+            return
+
+        # Генерируем шум строго под количество легальных ходов
+        noise = noise_config.get_noise(rng, len(legal_actions))
         frac = noise_config.exploration_fraction
 
-        for action_idx in list(self.child_priors.keys()):
-            old_p = self.child_priors[action_idx]
-            new_p = (1.0 - frac) * old_p + frac * noise[action_idx]
-            self.child_priors[action_idx] = float(new_p)
+        for i, action_idx in enumerate(legal_actions):
+            # Проверяем наличие ключа (он должен там быть из _expand_node)
+            if action_idx in self.child_priors:
+                old_p = self.child_priors[action_idx]
+                new_p = (1.0 - frac) * old_p + frac * noise[i]
+                self.child_priors[action_idx] = float(new_p)
 
-            if action_idx in self.children:
-                self.children[action_idx].prior_prob = float(new_p)
+                if action_idx in self.children:
+                    self.children[action_idx].prior_prob = float(new_p)
 
 
 class MCTS_Agent:
@@ -175,6 +184,9 @@ class MCTS_Agent:
     def set_random_seed(self, seed : int):
         self.random_seed_base = seed
 
+    def update_rng(self):
+        self.rng = np.random.default_rng(self.random_seed_base + self.game_state.current_move)
+
     def __init__(self, network : NetworkBase = None, c_puct: float = C_PUCT,
                  temperature: float = 1.0, noise_config: DirichletNoiseConfig = None, **kwargs):
         """
@@ -190,6 +202,7 @@ class MCTS_Agent:
         self.temperature = temperature
 
         self.random_seed_base = 42
+        self.rng = np.random.default_rng(self.random_seed_base)
 
         self.game_state : Game = Game()
 
@@ -218,6 +231,8 @@ class MCTS_Agent:
         self.recycle_branch(self.root)
 
         self.game_state.clear()
+
+        self.set_random_seed(42)
 
     def set_new_root(self, new_root: MCTSNode):
         if self.root is not None:
@@ -273,6 +288,8 @@ class MCTS_Agent:
         else:
             self.set_new_root(root)
 
+        self.update_rng()
+
         self.temperature = self.initial_temperature
         if self.game_state.current_move > TEMP_DECAY_TURN:
             for i in range(self.game_state.current_move - TEMP_DECAY_TURN):
@@ -281,7 +298,8 @@ class MCTS_Agent:
         self.root_player = self.game_state.current_player
 
         if self.root.is_expanded:
-            self.root.add_noise(self.noise_config, self.game_state, self.random_seed_base)
+            self.root.add_noise(self.noise_config, self.rng, self.get_random_seed())
+
 
         adjusted_simulations = num_simulations - self.root.visit_count
         # Выполняем num_simulations итераций MCTS
@@ -307,8 +325,6 @@ class MCTS_Agent:
 
         # Выбираем лучший ход на основе visit counts
         encoded_move, policy_distribution, best_node = self._select_action()
-
-
 
         #elapsed_time = time.time() - start_time
         #print(f"Время поиска лучшего хода search: {elapsed_time:.2f} сек")
@@ -342,7 +358,11 @@ class MCTS_Agent:
                 # Виртуальный узел (еще не создан)
                 # Q(s,a) = 0 для непосещенного узла
                 # U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + 0)
-                ucb_score = self.c_puct * prior_prob * math.sqrt(node.visit_count + 1)
+
+                # Принимаем Q неисследованного узла, как чистый выход нейросети данного узла (позиция не особо изменится)
+                q_value = node.raw_value
+                u_value = self.c_puct * prior_prob * math.sqrt(node.visit_count + 1)
+                ucb_score = q_value + u_value
 
             self.ucb_scores_cache[action_idx] = ucb_score
 
@@ -422,7 +442,7 @@ class MCTS_Agent:
         # Нормализуем policy
         policy_sum = np.sum(self.masked_policy_cache)
         if policy_sum > 0:
-            masked_policy = self.masked_policy_cache / policy_sum
+            self.masked_policy_cache /= policy_sum
         else:
             # Если все вероятности 0, делаем равномерное распределение по легальным ходам
             np.copyto(self.masked_policy_cache, self.legal_mask_cache)
@@ -435,7 +455,8 @@ class MCTS_Agent:
                 node.child_priors[action_idx] = self.masked_policy_cache[action_idx]
 
         if node == self.root:
-            node.add_noise(self.noise_config, self.game_state, self.random_seed_base)
+            node.add_noise(self.noise_config, self.rng, self.get_random_seed())
+
 
         utility = raw_value
 
@@ -509,6 +530,8 @@ class MCTS_Agent:
         np.copyto(self.game_state.legal_mask, self.root.delta_game.next_mask)
         self.game_state.has_mask = True
 
+    def get_random_seed(self):
+        return self.random_seed_base + self.game_state.current_move
 
     def _select_action(self) -> Tuple[int, np.ndarray, MCTSNode]:
         """
@@ -531,7 +554,8 @@ class MCTS_Agent:
             # Стохастический выбор с температурой
             visit_counts_temp = visit_counts ** (1.0 / self.temperature)
             policy_distribution = visit_counts_temp / np.sum(visit_counts_temp)
-            action_idx = np.random.choice(possible_moves_total, p=policy_distribution)
+
+            action_idx = self.rng.choice(possible_moves_total, p=policy_distribution)
 
         # Нормализуем visit counts для возврата (это MCTS-улучшенный policy)
         policy_distribution = visit_counts / np.sum(visit_counts) if np.sum(visit_counts) > 0 else visit_counts

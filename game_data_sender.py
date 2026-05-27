@@ -28,3 +28,5 @@ class GameDataSender:
 
     def send_game_log(self, game_id: str, game_log: dict):
         self._send_typed("game_log", game_id, game_log)
+
+

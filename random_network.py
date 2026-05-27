@@ -31,22 +31,20 @@ class ZMQNetworkClient(NetworkBase):
         self.socket.connect(host)
 
     def predict(self, state_numpy: np.ndarray, **kwargs) -> tuple:
+
+
         # Сериализуем numpy-массив (pickle делает это максимально эффективно для np.ndarray)
-        payload = pickle.dumps(state_numpy)
+        self.socket.send(state_numpy.tobytes(), copy=False)
 
-        # Отправляем запрос
-        self.socket.send(payload)
+        # Получаем 3 фрейма: policy bytes, value bytes, score bytes + name
+        frames = self.socket.recv_multipart()
 
-        # Блокируем выполнение, пока не придет ответ от инференс-сервера
-        reply = self.socket.recv()
-
-
-        # Распаковываем результат
-        policy, value, score, name = pickle.loads(reply)
-
+        policy = np.frombuffer(frames[0], dtype=np.float32)  # shape восстанавливается из размера
+        value = np.frombuffer(frames[1], dtype=np.float32)[0]  # скаляр
+        score = np.frombuffer(frames[2], dtype=np.float32)
+        name = frames[3].decode('utf-8')
 
         self.name = name
-
         return policy, value, score
 
 
@@ -57,13 +55,17 @@ class RandomNetwork(NetworkBase):
     Policy имеет небольшой случайный шум, чтобы избежать равных вероятностей
     и bias к меньшим индексам действий.
     """
-    def __init__(self, name="RandomAgent"):
+    def __init__(self, name="RandomAgent", random_seed: int = 42):
         super().__init__(name)
         self.rollout_games = 20
         self.rollout_turns = 20
-        self.randomise_value = False
-        self.randomise_score = False
+        self.randomise_value = True
+        self.randomise_score = True
         self.value_modifier = 1
+        self.random_seed = random_seed
+        self.rng = np.random.default_rng(self.random_seed)
+
+
         self.local_board = Board()
 
 
@@ -84,7 +86,7 @@ class RandomNetwork(NetworkBase):
 
         action_space_size = possible_moves_total
         dirichlet_alpha = 0.2
-        policy = np.random.dirichlet([dirichlet_alpha] * action_space_size).astype(np.float32)
+        policy = self.rng.dirichlet([dirichlet_alpha] * action_space_size).astype(np.float32)
 
 
         for i in range(BOARD_SIZE):
@@ -98,13 +100,13 @@ class RandomNetwork(NetworkBase):
 
         if self.randomise_score:
             alpha_array = np.full((board_size_sqr * 2 + 1,), dirichlet_alpha, dtype=np.float32)
-            scores = np.random.dirichlet(alpha_array).astype(np.float32)
+            scores = self.rng.dirichlet(alpha_array).astype(np.float32)
         else:
             scores = np.zeros((board_size_sqr * 2 + 1,), dtype=np.float32)
             scores[my_stones - enemy_stones + board_size_sqr] = 1.0
 
         if self.randomise_value:
-            value = uniform(-1,1) * self.value_modifier
+            value = self.rng.uniform(-1,1) * self.value_modifier
         else:
             raw_value = (my_stones - enemy_stones) * 3 / board_size_sqr
             value = max(min(raw_value, 0.9), -0.9)
@@ -164,14 +166,13 @@ class PytorchAgentWrapper(NetworkBase):
 
         # 3. Обработка результатов
         # Обязательно кастуем к float32 перед softmax, иначе в fp16 возможны underflow/overflow
-        policy_probabilities = F.softmax(policy_logits.to(torch.float32), dim=1)
-        policy_probabilities = policy_probabilities.squeeze(0).cpu().numpy()
+        policy_probabilities = F.softmax(policy_logits.to(torch.float32), dim=1).cpu().numpy()
 
         value_scalar = value_tensor.item()
 
         score_numpy = score_logits.squeeze(0).cpu().numpy()
 
-        return policy_probabilities, np.float32(value_scalar), score_numpy
+        return policy_probabilities[0], np.float32(value_scalar), score_numpy
 
 
 class BatchedPytorchAgentWrapper:
