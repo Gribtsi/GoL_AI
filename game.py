@@ -53,7 +53,7 @@ class Game:
 
         self.game_over = False
 
-        self.pass_history = np.zeros(MAX_MOVES_PER_GAME, dtype=np.bool_)
+        self.pass_history = np.zeros(max_moves, dtype=np.bool_)
         self.had_swap = False
 
         # Коми в пользу БЕЛЫХ
@@ -64,7 +64,7 @@ class Game:
         self.current_move = 0
 
     def interrupted(self) -> bool:
-        return self.game_over and (self.current_move < MAX_MOVES_PER_GAME) and (self.get_consequtive_passes() < 2)
+        return self.game_over and (self.current_move < self.max_moves) and (self.get_consequtive_passes() < 2)
 
     def get_consequtive_passes(self):
         move = self.current_move
@@ -409,7 +409,7 @@ class Game:
     def get_winner_and_margin_fast(self) -> Tuple[int,int]:
         black, white = self.board.fast_territories()
 
-        if (DRAW_AT_MAX_TURNS and (self.current_move >= MAX_MOVES_PER_GAME)) or (black == (white + self.komi)):
+        if (DRAW_AT_MAX_TURNS and (self.current_move >= self.max_moves)) or (black == (white + self.komi)):
             self.winner = EMPTY
             margin = 0
         elif black > white + self.komi:

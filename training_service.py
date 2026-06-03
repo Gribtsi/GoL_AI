@@ -114,7 +114,7 @@ def trainer_service():
 
     print("Trainer запущен. Ожидание данных...")
 
-    skips = 6
+    skips = 6*5
     current_skips = 0
 
     while True:
@@ -149,7 +149,7 @@ def trainer_service():
             current_skips += 1
 
             if current_skips >= skips:
-                print(f"Ожидание новых данных {new_samples}/{SAMPLES_PER_TRAINING} собрано")
+                print(f"Ожидание новых данных {new_samples}/{SAMPLES_PER_TRAINING} собрано за {skips // 6} мин")
                 current_skips = 0
             time.sleep(10)
 

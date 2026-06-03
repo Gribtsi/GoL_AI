@@ -214,6 +214,7 @@ class ZMQInferenceServer:
                                      np.frombuffer(req[2].buffer, dtype=np.float32).reshape(OBS_SHAPE))
                 actual_batch_size += 1
 
+
             # Добор с таймаутом если нужен
             if actual_batch_size < self.max_batch_size:
                 start_wait = time.time()

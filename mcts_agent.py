@@ -1,9 +1,9 @@
 import numpy as np
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 from config import BOARD_SIZE, board_size_sqr, possible_moves_total, DEEP_DEPTH, EMPTY, TEMP_DECAY_TURN, \
-    TEMP_DECAY_COEFF, C_PUCT, SMALL_TEMP
+    TEMP_DECAY_COEFF, C_PUCT, SMALL_TEMP, Q_INIT_LOSS, pass_code
 from move import decode_move
 from game import Game, DeltaGame
 import time
@@ -78,10 +78,10 @@ class MCTSNode:
         self.u_d_score = 0.0
 
         # ВИРТУАЛЬНЫЕ дочки - только prior probabilities
-        self.child_priors = {}  # {action_idx: prior_probability}
+        self.child_priors = np.full(possible_moves_total, -1.0, dtype=np.float32)  # {action_idx: prior_probability}
 
 
-        self.children = {}  # {action_idx: MCTSNode} - создаются лениво
+        self.children : List[Union[None, MCTSNode]] = [None] * possible_moves_total  # {action_idx: MCTSNode} - создаются лениво
         self.expected_score = 0
 
         self.is_expanded = False
@@ -104,8 +104,9 @@ class MCTSNode:
         self.u_score = 0.0
         self.u_d_score = 0.0
 
-        self.child_priors.clear()
-        self.children.clear()
+        self.child_priors.fill(0)
+        for i in range(possible_moves_total):
+            self.children[i] = None
 
         self.delta_game.next_mask.fill(0)
 
@@ -128,14 +129,16 @@ class MCTSNode:
         if self.is_terminal:
             return 1
         for i in self.children:
-            sum += self.children[i].count_terminal_nodes_in_tree()
+            if i is not None:
+                sum += i.count_terminal_nodes_in_tree()
         return sum
 
     def count_nodes(self):
         sum = 1
 
         for i in self.children:
-            sum += self.children[i].count_nodes()
+            if i is not None:
+                sum += i.count_nodes()
 
         return sum
 
@@ -148,7 +151,7 @@ class MCTSNode:
             return
 
         # Получаем индексы легальных ходов напрямую из маски (как ты предложил)
-        legal_actions = np.nonzero(self.delta_game.next_mask)[0]
+        legal_actions = np.flatnonzero(self.delta_game.next_mask)
 
         if len(legal_actions) == 0:
             return
@@ -159,13 +162,15 @@ class MCTSNode:
 
         for i, action_idx in enumerate(legal_actions):
             # Проверяем наличие ключа (он должен там быть из _expand_node)
-            if action_idx in self.child_priors:
-                old_p = self.child_priors[action_idx]
-                new_p = (1.0 - frac) * old_p + frac * noise[i]
-                self.child_priors[action_idx] = float(new_p)
+            if self.child_priors[action_idx] < 0:
+                continue
 
-                if action_idx in self.children:
-                    self.children[action_idx].prior_prob = float(new_p)
+            old_p = self.child_priors[action_idx]
+            new_p = (1.0 - frac) * old_p + frac * noise[i]
+            self.child_priors[action_idx] = float(new_p)
+
+            if self.children[action_idx] is not None:
+                self.children[action_idx].prior_prob = float(new_p)
 
 
 class MCTS_Agent:
@@ -222,7 +227,7 @@ class MCTS_Agent:
 
         self.node_pool = []
         for i in range(DEEP_DEPTH + 1):
-            self.node_pool.append(MCTSNode(Game()))
+            self.node_pool.append(MCTSNode())
 
         self.root_player = EMPTY
 
@@ -236,10 +241,11 @@ class MCTS_Agent:
 
     def set_new_root(self, new_root: MCTSNode):
         if self.root is not None:
-            for node in self.root.children.values():
+            for node in self.root.children:
                 if node == new_root:
                     continue
-                self.recycle_branch(node)
+                elif node is not None:
+                    self.recycle_branch(node)
 
             old_root = self.root
             self.root = new_root
@@ -253,11 +259,49 @@ class MCTS_Agent:
 
     def recycle_branch(self, node: MCTSNode):
         """Рекурсивно возвращает всё поддерево в пул."""
-        for child in node.children.values():
-            self.recycle_branch(child)
+        for child in node.children:
+            if child is not None:
+                self.recycle_branch(child)
 
         node.reset()
         self.node_pool.append(node)
+
+    def begin_search(self, root: MCTSNode = None, num_simulations: int = DEEP_DEPTH) -> None:
+        """Инициализируем поиск - прокидываем корень, добавляем шум, если реюз дерева, устанавливаем температуру"""
+        if root is None:
+            self.root = self.node_pool.pop()
+            self.game_state.clear()
+            self.first_root = self.root
+
+            self.game_state.update_legal_moves_mask()
+            np.copyto(self.root.delta_game.next_mask, self.game_state.legal_mask)
+        else:
+            self.set_new_root(root)
+
+        self.temperature = self.initial_temperature
+        if self.game_state.current_move > TEMP_DECAY_TURN:
+            for i in range(self.game_state.current_move - TEMP_DECAY_TURN):
+                self.temperature *= TEMP_DECAY_COEFF
+
+        self.root_player = self.game_state.current_player
+
+        if self.root.is_expanded:
+            self.root.add_noise(self.noise_config, self.rng, self.get_random_seed())
+
+        self.update_rng()
+
+
+    def select_leaf(self) -> Tuple[MCTSNode, List[MCTSNode]]:
+        node = self.root
+        search_path = [node]
+
+        # 1. Selection: спускаемся по дереву, выбирая лучшие действия по PUCT
+        while not node.is_leaf() and not self.game_state.game_over:
+            node = self._select_child(node)
+            search_path.append(node)
+
+        return node, search_path
+
 
 
     def search(self, root: MCTSNode = None, num_simulations: int = DEEP_DEPTH) -> Tuple[int, np.ndarray, MCTSNode]:
@@ -278,41 +322,14 @@ class MCTS_Agent:
 
         # Создаем корневой узел
 
-        if root is None:
-            self.root = self.node_pool.pop()
-            self.game_state.clear()
-            self.first_root = self.root
-
-            self.game_state.update_legal_moves_mask()
-            np.copyto(self.root.delta_game.next_mask, self.game_state.legal_mask)
-        else:
-            self.set_new_root(root)
-
-        self.update_rng()
-
-        self.temperature = self.initial_temperature
-        if self.game_state.current_move > TEMP_DECAY_TURN:
-            for i in range(self.game_state.current_move - TEMP_DECAY_TURN):
-                self.temperature *= TEMP_DECAY_COEFF
-
-        self.root_player = self.game_state.current_player
-
-        if self.root.is_expanded:
-            self.root.add_noise(self.noise_config, self.rng, self.get_random_seed())
-
+        self.begin_search(root)
 
         adjusted_simulations = num_simulations - self.root.visit_count
         # Выполняем num_simulations итераций MCTS
         for _ in range(adjusted_simulations):
-            node = self.root
-            search_path = [node]
 
-            # 1. Selection: спускаемся по дереву, выбирая лучшие действия по PUCT
-            while not node.is_leaf() and not self.game_state.game_over:
-                node = self._select_child(node)
-                search_path.append(node)
+            node, search_path = self.select_leaf()
 
-            # 2. Expansion: если узел не терминальный, разворачиваем его
             if not self.game_state.game_over:
                 value = self._expand_node(node)
             else:
@@ -342,12 +359,12 @@ class MCTS_Agent:
         self.ucb_scores_cache.fill(-np.inf)
 
         # Вычисляем UCB для всех возможных действий (виртуальных и реальных)
-        for action_idx, prior_prob in node.child_priors.items():
+        for action_idx, prior_prob in enumerate(node.child_priors):
 
-            if prior_prob <= 0:
+            if prior_prob < 0:
                 continue
 
-            if action_idx in node.children:
+            if node.children[action_idx] is not None:
                 # Реальный дочерний узел - используем его статистику
                 child = node.children[action_idx]
                 q_value = -child.mean_value
@@ -360,7 +377,7 @@ class MCTS_Agent:
                 # U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + 0)
 
                 # Принимаем Q неисследованного узла, как чистый выход нейросети данного узла (позиция не особо изменится)
-                q_value = node.raw_value
+                q_value = node.raw_value - Q_INIT_LOSS
                 u_value = self.c_puct * prior_prob * math.sqrt(node.visit_count + 1)
                 ucb_score = q_value + u_value
 
@@ -386,10 +403,14 @@ class MCTS_Agent:
                 node.child_priors[action_idx] = -float('inf')
 
         if best_action_idx is None:
-            raise ValueError(f"No valid moves in game!")
+            best_action_idx = pass_code
+            print("No valid moves in game!")
+            print(node.child_priors)
+            print(self.ucb_scores_cache)
+            #raise ValueError(f"No valid moves in game!")
 
         # Если выбранный узел еще не создан - создаем его сейчас
-        if best_action_idx not in node.children:
+        if  node.children[best_action_idx] is None:
             # Декодируем действие
 
             child_node = self.node_pool.pop()
@@ -413,25 +434,11 @@ class MCTS_Agent:
 
         return node.children[best_action_idx]
 
+    def get_network_input_pytorch(self):
+        return self.game_state.get_network_input_pytorch()
 
-    def _expand_node(self, node: MCTSNode) -> float:
-        """
-        Развернуть узел: получить policy и value из нейросети, создать ВИРТУАЛЬНЫЕ дочерние узлы.
 
-        Args:
-            node: Узел для разворачивания
-
-        Returns:
-            Value оценка этой позиции от нейросети
-        """
-
-        start_time = time.time()
-
-        # Получаем входной тензор для нейросети
-        state_tensor = self.game_state.get_network_input_pytorch()
-
-        # Предсказание от нейросети: policy (723,) и value (скаляр)
-        policy, raw_value, score = self.network.predict(state_tensor)
+    def _expand_node_from_network_result(self, node: MCTSNode, policy: np.ndarray, raw_value: float, score: np.ndarray):
 
         # Получаем маску легальных ходов
         self.game_state.get_legal_moves_mask_lazy(self.legal_mask_cache)
@@ -453,6 +460,8 @@ class MCTS_Agent:
         for action_idx in range(possible_moves_total):
             if self.legal_mask_cache[action_idx] > 0:
                 node.child_priors[action_idx] = self.masked_policy_cache[action_idx]
+            else:
+                node.child_priors[action_idx] = -np.inf
 
         if node == self.root:
             node.add_noise(self.noise_config, self.rng, self.get_random_seed())
@@ -476,11 +485,30 @@ class MCTS_Agent:
 
         node.is_expanded = True
 
-        elapsed = time.time() - start_time
         # print(f"expansion took {elapsed}")
 
         # Value с точки зрения текущего игрока
         return utility
+
+    def _expand_node(self, node: MCTSNode) -> float:
+        """
+        Развернуть узел: получить policy и value из нейросети, создать ВИРТУАЛЬНЫЕ дочерние узлы.
+
+        Args:
+            node: Узел для разворачивания
+
+        Returns:
+            Value оценка этой позиции от нейросети
+        """
+
+        # Получаем входной тензор для нейросети
+        state_tensor = self.game_state.get_network_input_pytorch()
+
+        # Предсказание от нейросети: policy (723,) и value (скаляр)
+        policy, raw_value, score = self.network.predict(state_tensor)
+
+        return self._expand_node_from_network_result(node, policy, raw_value, score)
+
 
     def _get_terminal_value(self, node: MCTSNode) -> float:
         """
@@ -543,8 +571,9 @@ class MCTS_Agent:
         # Собираем visit counts для всех дочерних узлов
         visit_counts = np.zeros(possible_moves_total, dtype=np.float32)
 
-        for action_idx, child in self.root.children.items():
-            visit_counts[action_idx] = child.visit_count
+        for action_idx, child in enumerate(self.root.children):
+            if child is not None:
+                visit_counts[action_idx] = child.visit_count
 
         # Применяем температуру для сэмплирования
         if self.temperature <= SMALL_TEMP:

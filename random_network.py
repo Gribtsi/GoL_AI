@@ -19,9 +19,6 @@ class NetworkBase:
     def predict(self, state_numpy: np.ndarray, **kwargs) -> (np.ndarray, np.float32, np.ndarray):
         pass
 
-
-
-
 class ZMQNetworkClient(NetworkBase):
     def __init__(self, host=get_inference_service_address(0), name="ZMQClientAgent"):
         super().__init__(name)
@@ -30,14 +27,43 @@ class ZMQNetworkClient(NetworkBase):
         # Подключаемся к сервису в Docker
         self.socket.connect(host)
 
-    def predict(self, state_numpy: np.ndarray, **kwargs) -> tuple:
+        # Защита от нарушения паттерна REQ-REP (строгое чередование send и recv)
+        self._request_pending = False
 
+    def send_request(self, state_numpy: np.ndarray, **kwargs) -> None:
+        """Асинхронно отправляет запрос (не блокирует)"""
+        if self._request_pending:
+            raise RuntimeError("ZMQ REQ Socket Error: Нельзя отправить новый запрос, не получив результат предыдущего.")
 
-        # Сериализуем numpy-массив (pickle делает это максимально эффективно для np.ndarray)
         self.socket.send(state_numpy.tobytes(), copy=False)
+        self._request_pending = True
 
-        # Получаем 3 фрейма: policy bytes, value bytes, score bytes + name
-        frames = self.socket.recv_multipart()
+    def result_ready(self) -> bool:
+        """Мгновенно проверяет, пришел ли ответ, без блокировки потока"""
+        if not self._request_pending:
+            return False
+
+        # timeout=0 означает мгновенный возврат (опрашивает наличие POLLIN событий)
+        return self.socket.poll(timeout=0) != 0
+
+    def get_result(self, block: bool = False):
+        """
+        Забирает результат.
+        Если block=False и ответ еще не готов, возвращает None (чтобы не упасть с ошибкой).
+        Если block=True, будет ждать ответа синхронно.
+        """
+        if not self._request_pending:
+            raise RuntimeError("Нет ожидающего запроса для получения результата.")
+
+        flags = 0 if block else zmq.NOBLOCK
+
+        try:
+            frames = self.socket.recv_multipart(flags=flags)
+        except zmq.error.Again:
+            # Срабатывает, если мы вызвали recv с NOBLOCK, а данных еще нет
+            return None
+
+        self._request_pending = False
 
         policy = np.frombuffer(frames[0], dtype=np.float32)  # shape восстанавливается из размера
         value = np.frombuffer(frames[1], dtype=np.float32)[0]  # скаляр
@@ -46,6 +72,12 @@ class ZMQNetworkClient(NetworkBase):
 
         self.name = name
         return policy, value, score
+
+    def predict(self, state_numpy: np.ndarray, **kwargs) -> tuple:
+        """Старый блокирующий метод для обратной совместимости"""
+        self.send_request(state_numpy, **kwargs)
+        # Устанавливаем block=True, чтобы дождаться ответа
+        return self.get_result(block=True)
 
 
 class RandomNetwork(NetworkBase):
