@@ -1,3 +1,4 @@
+from collections import namedtuple
 from typing import Tuple, Union
 import numpy as np
 from numba import njit
@@ -6,6 +7,37 @@ from config import BOARD_SIZE, board_size_sqr, EMPTY, BLACK, WHITE, NN_HISTORY, 
     symbols, possible_moves_total, pass_code
 from move import decode_move
 
+
+
+
+BoardTemp = namedtuple("BoardTemp", [
+    "temp_state_1",
+    "temp_state_2",
+    "temp_hash_1",
+    "temp_hash_2",
+    "temp_positions_queue",
+    "temp_marked_for_death",
+    "temp_visited",
+    "tensor",
+])
+
+DeltaBoardArray = namedtuple("DeltaBoardArray",[
+    "next_state",
+    "next_hash",
+    "valid"
+])
+
+BoardData = namedtuple("BoardData",[
+    "current_state",
+    "history_stack",
+    "history_hashes",
+    "zobrist_table",
+
+    "history_ptr",
+    "history_hash_ptr",
+    "history_count",
+    "history_hash_count",
+])
 
 LAZY_PERMIT = 1
 PRECIESE_PERMIT = 2
@@ -209,7 +241,7 @@ def apply_game_of_life(state: np.ndarray, color: int, future_state: np.ndarray) 
     return
 
 @njit
-def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.ndarray, queue_x : np.ndarray, queue_y : np.ndarray) -> None:
+def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.ndarray, queue : np.ndarray) -> None:
     """
     Numba-метод для вычисления территорий по правилам Тромпа-Тейлора.
     """
@@ -219,8 +251,7 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
 
 
     # Заранее выделяем память под массивы для BFS очереди
-    queue_x.fill(0)
-    queue_y.fill(0)
+    queue.fill(0)
     #queue_y = np.zeros(board_size_sqr, dtype=np.int32)
 
     # Векторы направлений для 4 соседей
@@ -235,8 +266,8 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
                 tail = 0
 
                 # Добавляем стартовую ячейку
-                queue_x[tail] = x
-                queue_y[tail] = y
+                queue[tail, 0] = x
+                queue[tail, 1] = y
                 tail += 1
                 visited[x, y] |= 1
 
@@ -245,8 +276,8 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
 
                 # BFS-цикл
                 while head < tail:
-                    cx = queue_x[head]
-                    cy = queue_y[head]
+                    cx = queue[head, 0]
+                    cy = queue[head, 1]
                     head += 1
 
                     # Проверяем 4 соседей
@@ -261,8 +292,8 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
                             if n_val == EMPTY:
                                 if not ((visited[nx, ny] & 1) == 1):
                                     visited[nx, ny] |= 1
-                                    queue_x[tail] = nx
-                                    queue_y[tail] = ny
+                                    queue[tail, 0] = nx
+                                    queue[tail, 1] = ny
                                     tail += 1
 
                             else:
@@ -277,9 +308,10 @@ def get_territories(board: np.ndarray, visited: np.ndarray, territory_map: np.nd
                 if (found_color != EMPTY) and not is_mixed:
                     # Вся история посещений региона уже лежит в массиве queue от 0 до tail
                     for i in range(tail):
-                        rx = queue_x[i]
-                        ry = queue_y[i]
+                        rx = queue[i, 0]
+                        ry = queue[i, 1]
                         territory_map[rx, ry] = found_color
+
 
 @njit
 def get_opponent(color: int) -> int:
@@ -312,13 +344,11 @@ def compute_zobrist_hash_numba(state: np.ndarray, z_table: np.ndarray, zobrist_h
     """
     Вычисляет 256-битный хеш доски (возвращает массив из 4 uint64).
     """
-    rows, cols = state.shape
-
     #h = np.zeros(4, dtype=np.uint64)
     zobrist_hash.fill(0)
 
-    for r in range(rows):
-        for c in range(cols):
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
             val = state[r, c]
 
             # Маппинг цвета камня в индекс таблицы [0, 1, 2].
@@ -365,106 +395,86 @@ def check_superko_numba(state_hash: np.ndarray, hash_history: np.ndarray, count:
     return True
 
 @njit
-def placement_permission_numba(current_state: np.ndarray,
-        history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
-        hash_count: int,  # Текущее количество хешей в буфере
-        zobrist_table: np.ndarray,  # Таблица для вычисления хешей
+def placement_permission_numba(
+        board: BoardData,
+        temp: BoardTemp,
         current_player: int,
-        x: int, y: int,
-        future_state_1 : np.ndarray,
-
-        visited: np.ndarray,
-        marked_for_death:np.ndarray,
-        group_array:np.ndarray,
-
-        zobrist_hash1 :np.ndarray):
+        x: int, y: int):
 
     if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
         return False
 
-    if current_state[x, y] != EMPTY:
+    if board.current_state[x, y] != EMPTY:
         return False
 
-    future_state_1[:] = current_state
+    temp.temp_state_1[:] = board.current_state
 
-    future_state_1[x, y] = current_player
+    temp.temp_state_1[x, y] = current_player
 
-    any_capture = check_captures_local(x, y, future_state_1, marked_for_death, visited, group_array)
+    any_capture = check_captures_local(x, y, temp.temp_state_1, temp.temp_marked_for_death, temp.temp_visited, temp.temp_positions_queue)
     if any_capture:
-        remove_captured_stones(future_state_1, marked_for_death, current_player)
+        remove_captured_stones(temp.temp_state_1, temp.temp_marked_for_death, current_player)
 
     # Проверка на самоубийственный ход (используем распаковку 3 значений из новой версии функции)
-    visited.fill(0)
-    size, liberties = find_group_and_liberties(x, y, future_state_1, group_array, visited)
+    temp.temp_visited.fill(0)
+    size, liberties = find_group_and_liberties(x, y,temp.temp_state_1, temp.temp_positions_queue, temp.temp_visited)
     if (liberties == 0) and (size > 0):
         return False
 
     # Проверка правила Суперко (Зобристово хеширование)
-    compute_zobrist_hash_numba(future_state_1, zobrist_table, zobrist_hash1)
-    if not check_superko_numba(zobrist_hash1, history_hashes, hash_count):
+    compute_zobrist_hash_numba(temp.temp_state_1, board.zobrist_table, temp.temp_hash_1)
+    if not check_superko_numba(temp.temp_hash_1, board.history_hashes, board.history_hash_count[0]):
         return False
 
     return True
 
 @njit(cache=True)
 def position_permissions_numba(
-        current_state: np.ndarray,
-        history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
-        hash_count: int,  # Текущее количество хешей в буфере
-        zobrist_table: np.ndarray,  # Таблица для вычисления хешей
+        board: BoardData,
+        temp: BoardTemp,
         current_player: int,
         x: int, y: int,
-        future_state_1 : np.ndarray,
-        future_state_2 : np.ndarray,
-
-        visited: np.ndarray,
-        marked_for_death:np.ndarray,
-        group_array:np.ndarray,
-
-        zobrist_hash1 :np.ndarray,
-        zobrist_hash2 :np.ndarray
-
 ) -> Tuple[bool, bool]:
     # --- Быстрые проверки ---
     if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
         return False, False
 
-    if current_state[x, y] != EMPTY:
+    if board.current_state[x, y] != EMPTY:
         return False, False
 
     # --- ШАГ 1: Симуляция постановки камня ---
 
-    future_state_1[:] = current_state
+    temp.temp_state_1[:] = board.current_state
 
-    future_state_1[x, y] = current_player
+    temp.temp_state_1[x, y] = current_player
 
 
-    any_capture = check_captures_local(x,y, future_state_1, marked_for_death, visited, group_array)
+    any_capture = check_captures_local(x,y, temp.temp_state_1, temp.temp_marked_for_death, temp.temp_visited, temp.temp_positions_queue)
     if any_capture:
-        remove_captured_stones(future_state_1, marked_for_death, current_player)
+        remove_captured_stones(temp.temp_state_1, temp.temp_marked_for_death, current_player)
 
     # Проверка на самоубийственный ход (используем распаковку 3 значений из новой версии функции)
-    visited.fill(0)
-    size, liberties = find_group_and_liberties(x, y, future_state_1, group_array, visited)
+    temp.temp_visited.fill(0)
+    size, liberties = find_group_and_liberties(x, y, temp.temp_state_1, temp.temp_positions_queue, temp.temp_visited)
     if (liberties == 0) and (size > 0):
         return False, False
 
     # Проверка правила Суперко (Зобристово хеширование)
-    compute_zobrist_hash_numba(future_state_1, zobrist_table, zobrist_hash1)
-    if not check_superko_numba(zobrist_hash1, history_hashes, hash_count):
+    compute_zobrist_hash_numba(temp.temp_state_1, board.zobrist_table, temp.temp_hash_1)
+    if not check_superko_numba(temp.temp_hash_1, board.history_hashes, board.history_hash_count[0]):
         return False, False
 
     # --- ШАГ 2: Симуляция цикла жизни (Game of Life) ---
-    game_of_life_with_captures(future_state_1, future_state_2, visited, marked_for_death, group_array, current_player)
+    game_of_life_with_captures(temp.temp_state_1, temp.temp_state_2, temp.temp_visited, temp.temp_marked_for_death, temp.temp_positions_queue, current_player)
 
     # Финальная проверка Суперко для второй стадии
-    compute_zobrist_hash_numba(future_state_2, zobrist_table, zobrist_hash2)
-    if not check_superko_numba(zobrist_hash2, history_hashes, hash_count):
+    compute_zobrist_hash_numba(temp.temp_state_2, board.zobrist_table, temp.temp_hash_2)
+    if not check_superko_numba(temp.temp_hash_2, board.history_hashes, board.history_hash_count[0]):
         return True, False
 
     # Проверка, не сцепился ли Game of Life с камнем, вернув доску в future_state_1
-    if (zobrist_hash1[0] == zobrist_hash2[0] and zobrist_hash1[1] == zobrist_hash2[1] and
-            zobrist_hash1[2] == zobrist_hash2[2] and zobrist_hash1[3] == zobrist_hash2[3]):
+    if (temp.temp_hash_1[0] == temp.temp_hash_2[0] and temp.temp_hash_1[1] == temp.temp_hash_2[1] and
+            temp.temp_hash_1[2] == temp.temp_hash_2[2] and temp.temp_hash_1[3] == temp.temp_hash_2[3]):
         return True, False
 
     # Если все проверки пройдены, ход полностью легален
@@ -478,30 +488,17 @@ def swap_colours(current_state: np.ndarray, out: np.ndarray):
 
 @njit
 def get_legal_moves_mask_numba(
-        current_state: np.ndarray,
-        history_hashes: np.ndarray,  # Передаем массив хешей вместо 3D-массива досок
-        hash_count: int,  # Текущее количество хешей в буфере
-        zobrist_table: np.ndarray,  # Таблица для вычисления хешей
+        board: BoardData,
+        temp: BoardTemp,
         current_player: int,
         out: np.ndarray,
-
-        future_state_1: np.ndarray,
-        future_state_2: np.ndarray,
-
-        visited: np.ndarray,
-        marked_for_death: np.ndarray,
-        group_array: np.ndarray,
-
-        zobrist_hash1: np.ndarray,
-        zobrist_hash2: np.ndarray
 ) -> None:
 
     # prange распараллеливает внешний цикл
 
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
-            placement, gol = position_permissions_numba(current_state, history_hashes, hash_count, zobrist_table, current_player, x, y,
-                                                        future_state_1, future_state_2, visited, marked_for_death, group_array, zobrist_hash1, zobrist_hash2)
+            placement, gol = position_permissions_numba(board, temp, current_player, x, y)
 
             idx_no_life = x * BOARD_SIZE + y
             if placement:
@@ -518,11 +515,11 @@ def get_legal_moves_mask_numba(
 
 #Истина, если клетка пустая
 @njit
-def get_legal_moves_mask_lazy_numba(current_state: np.ndarray, out: np.ndarray):
+def get_legal_moves_mask_lazy_numba(board: BoardData, out: np.ndarray):
     for x in range(BOARD_SIZE):
         for y in range(BOARD_SIZE):
 
-            empty = current_state[x,y] == EMPTY
+            empty = board.current_state[x,y] == EMPTY
 
             idx_no_life = x * BOARD_SIZE + y
             idx_with_life = board_size_sqr + idx_no_life
@@ -535,469 +532,311 @@ def get_legal_moves_mask_lazy_numba(current_state: np.ndarray, out: np.ndarray):
                 out[idx_with_life] = 0
 
 
-class DeltaBoard:
-    def __init__(self):
-        #Потому что ход прогоняет 2 стейта
-        #Хранит новый куррент и стейт после текущего куррента
-        self.next_state = np.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-
-        #Хранит хеш текущего куррента и стейта после него (next_state по 1 индексу)
-        self.next_hash = np.zeros((2,4), dtype=np.uint64)
-
-        #Когда пас, типа "заигнорь меня"
-        self.valid = False
+@njit
+def copyto_numba(dst, src):
+    dst[:] = src
 
 
-class Board:
+
+@njit
+def circle_add(val: int, add: int, max: int) -> int:
+    return (val + max + add) % max
+
+@njit
+def apply_delta_board_numba(deltas: DeltaBoardArray, ptr: int, board: BoardData):
+
+    if not deltas.valid[ptr]:
+        return
+
+    copyto_numba(board.history_stack[board.history_ptr[0]], board.current_state)
+    copyto_numba(board.history_hashes[board.history_hash_ptr[0]], deltas.next_hash[ptr, 1])
+
+    inc_history_ptr(board)
+
+    copyto_numba(board.history_stack[board.history_ptr[0]], deltas.next_state[ptr, 1])
+    copyto_numba(board.history_hashes[board.history_hash_ptr[0]], deltas.next_hash[ptr, 0])
+
+    inc_history_ptr(board)
+
+    copyto_numba(board.current_state, deltas.next_state[ptr, 0])
+
+@njit
+def inc_history_ptr(board: BoardData):
+    board.history_ptr[0] = circle_add(board.history_ptr[0], 1, NN_HISTORY)
+    board.history_count[0] = board.history_count[0] + 1
+
+    board.history_hash_ptr[0] = circle_add(board.history_hash_ptr[0], 1, MAX_HISTORY)
+    board.history_hash_count[0] = board.history_hash_count[0] + 1
+
+@njit
+def dec_history_ptr(board: BoardData):
+    board.history_ptr[0] = circle_add(board.history_ptr[0], -1, NN_HISTORY)
+    board.history_count[0] = board.history_count[0] + 1
+
+    board.history_hash_ptr[0] = circle_add(board.history_hash_ptr[0], -1, MAX_HISTORY)
+    board.history_hash_count[0] = board.history_hash_count[0] + 1
+
+@njit
+def push_to_history_numba(board: BoardData, temp: BoardTemp, state: np.ndarray):
     """
-    Класс доски для игры Go + Game of Life.
-
-    Управляет состоянием игры, валидацией и применением ходов.
+    Добавляет состояние в кольцевой буфер истории позиций и сохраняет его хеш.
     """
+    # Считаем 256-битный хеш
+    compute_zobrist_hash_numba(board.current_state, board.zobrist_table, temp.temp_hash_1)
 
-    cached_zobrist_table = None
+    copyto_numba(board.history_stack[board.history_ptr[0]], state)
+    copyto_numba(board.history_hashes[board.history_hash_ptr[0]], temp.temp_hash_1)
 
-    def __init__(self):
-        """Инициализация доски."""
+    inc_history_ptr(board)
 
-        self.current_state = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        self.history_stack = np.zeros((NN_HISTORY, BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-
-        # ИСТОРИЯ ХЕШЕЙ (нужна исключительно для быстрой работы правила Суперко)
-        self.history_hashes = np.zeros((MAX_HISTORY, 4), dtype=np.uint64)
-
-
-        if Board.cached_zobrist_table is None:
-            self.zobrist_table = generate_zobrist_table()
-            Board.cached_zobrist_table = self.zobrist_table
-        else:
-            self.zobrist_table = Board.cached_zobrist_table
-
-        self.history_ptr = 0
-        self.history_hash_ptr = 0
-
-        self.history_count = 0
-        self.history_hash_count = 0
-
-        self.future_state_1 = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        self.future_state_2 = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-
-        self.temp_hash_1 =  np.zeros(4, dtype=np.uint64)
-        self.temp_hash_2 =  np.zeros(4, dtype=np.uint64)
-
-        self.temp_group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
-        self.temp_marked_for_death = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        self.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-
-        self.temp_queue_x = np.zeros(board_size_sqr, dtype=np.int32)
-        self.temp_queue_y = np.zeros(board_size_sqr, dtype=np.int32)
-
-        self.tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, IN_CHANNELS), dtype=np.float32)
-
-    def clear(self):
-        self.current_state.fill(0)
-        self.history_stack.fill(0)
-        self.history_hashes.fill(0)
-
-        self.history_ptr = 0
-        self.history_hash_ptr = 0
-
-        self.history_count = 0
-        self.history_hash_count = 0
-
-    def clone(self):
-        new_board = self.__class__.__new__(self.__class__)
-
-        # Копируем текущие и будущие состояния
-        new_board.current_state = self.current_state.copy()
-        new_board.future_state_1 = self.future_state_1.copy()
-        new_board.future_state_2 = self.future_state_2.copy()
-
-        # Zobrist-таблица неизменна для конкретного размера доски,
-        # поэтому просто передаем ссылку (экономим память и время)
-        new_board.zobrist_table = self.zobrist_table
-
-        # Копируем массивы истории
-        new_board.history_stack = self.history_stack.copy()
-        new_board.history_hashes = self.history_hashes.copy()
-
-        # Копируем скалярные значения указателей и счетчиков (передаются по значению)
-        new_board.history_ptr = self.history_ptr
-        new_board.history_hash_ptr = self.history_hash_ptr
-        new_board.history_count = self.history_count
-        new_board.history_hash_count = self.history_hash_count
-
-        new_board.temp_hash_1 =  np.zeros(4, dtype=np.uint64)
-        new_board.temp_hash_2 =  np.zeros(4, dtype=np.uint64)
-
-        new_board.temp_group_array = np.empty((board_size_sqr, 2), dtype=np.int32)
-        new_board.temp_marked_for_death = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        new_board.temp_visited = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-
-        new_board.temp_queue_x = np.zeros(board_size_sqr, dtype=np.int32)
-        new_board.temp_queue_y = np.zeros(board_size_sqr, dtype=np.int32)
-
-        new_board.tensor = np.zeros((BOARD_SIZE, BOARD_SIZE, IN_CHANNELS), dtype=np.float32)
-
-        return new_board
-
-    def undo(self):
-
-
-
-        self.dec_ptr()
-        self.dec_ptr()
-
-        self.dec_hash_ptr()
-        self.dec_hash_ptr()
-
-        np.copyto(self.current_state, self.history_stack[self.history_ptr])
-
-    #Воркер спавнит процессы форком - чтобы все нумба методы скомпилились 1 раз на все процессы
-    def compile(self):
-        temp_res = np.zeros(possible_moves_total, dtype=np.bool_)
-        get_legal_moves_mask_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table, BLACK, temp_res, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array,
-                                   self.temp_hash_1, self.temp_hash_2)
-        get_legal_moves_mask_lazy_numba(self.current_state, temp_res)
-        placement_permission_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
-                                   BLACK, 0, 0, self.future_state_1, self.temp_visited,
-                                   self.temp_marked_for_death,
-                                   self.temp_group_array, self.temp_hash_1)
-
-        get_opponent(BLACK)
-        get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x, self.temp_queue_y)
-
-    def apply_delta(self, delta_board : DeltaBoard):
-
-
-        if not delta_board.valid:
-            return
-
-        np.copyto(self.history_stack[self.history_ptr], self.current_state)
-        np.copyto(self.history_hashes[self.history_hash_ptr], delta_board.next_hash[1])
-
-        self.inc_ptr()
-        self.inc_hash_ptr()
-
-        np.copyto(self.history_stack[self.history_ptr], delta_board.next_state[1])
-        np.copyto(self.history_hashes[self.history_hash_ptr], delta_board.next_hash[0])
-
-        self.inc_ptr()
-        self.inc_hash_ptr()
-
-        np.copyto(self.current_state, delta_board.next_state[0])
-
-    def inc_ptr(self):
-        self.history_ptr = (self.history_ptr + 1) % NN_HISTORY
-        if self.history_count < NN_HISTORY:
-            self.history_count += 1
-
-    def dec_ptr(self):
-        self.history_ptr = (self.history_ptr - 1 + NN_HISTORY) % NN_HISTORY
-        if self.history_count > 0:
-            self.history_count -= 1
-
-    def inc_hash_ptr(self):
-        self.history_hash_ptr = (self.history_hash_ptr + 1) % MAX_HISTORY
-        if self.history_hash_count < MAX_HISTORY:
-            self.history_hash_count += 1
-
-    def dec_hash_ptr(self):
-        self.history_hash_ptr = (self.history_hash_ptr - 1 + MAX_HISTORY) % MAX_HISTORY
-        if self.history_hash_count > 0:
-            self.history_hash_count -= 1
-
-    def copy(self, target: 'Board'):
-        # Копируем содержимое массивов (in-place перезапись памяти)
-
-        np.copyto(target.current_state, self.current_state)
-        np.copyto(target.history_stack, self.history_stack)
-        np.copyto(target.history_hashes, self.history_hashes)
-
-        # Копируем примитивные типы (скаляры)
-        target.history_ptr = self.history_ptr
-        target.history_hash_ptr = self.history_hash_ptr
-        target.history_count = self.history_count
-        target.history_hash_count = self.history_hash_count
-
-        np.copyto(target.tensor, self.tensor)
-
-    def push_to_history(self, state: np.ndarray):
-        """
-        Добавляет состояние в кольцевой буфер истории позиций и сохраняет его хеш.
-        """
-        # Считаем 256-битный хеш
-        compute_zobrist_hash_numba(state, self.zobrist_table, self.temp_hash_1)
-
-        np.copyto(self.history_stack[self.history_ptr], state)
-        np.copyto(self.history_hashes[self.history_hash_ptr], self.temp_hash_1)
-
-
-        self.inc_ptr()
-        self.inc_hash_ptr()
-
-    def get_legal_moves_mask_lazy(self, out: np.ndarray):
-        return get_legal_moves_mask_lazy_numba(self.current_state, out)
-
-
-    def get_legal_moves_mask(self, current_player: int, out: np.ndarray):
-        return get_legal_moves_mask_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
-                                          current_player, out, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
-                                          self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
-
-    def is_move_legal(self, current_player: int, x:int, y:int, gol:int) -> Tuple[Union[bool, None], Union[bool, None]]:
+@njit()
+def is_legal_board_move_numba(board: BoardData, temp: BoardTemp, current_player: int, x:int, y:int, gol:int) -> Tuple[int, int]:
 
         if gol == 0:
-            return placement_permission_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
-                                          current_player, x, y, self.future_state_1, self.temp_visited, self.temp_marked_for_death,
-                                          self.temp_group_array, self.temp_hash_1), None
+            res = placement_permission_numba(board, temp, current_player, x, y)
+            return PRECIESE_PERMIT if res else 0, LAZY_PERMIT
+
         elif gol == 1:
-            placement, gol = position_permissions_numba(self.current_state, self.history_hashes, self.history_hash_count, self.zobrist_table,
-                                          current_player, x,y, self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death,
-                                          self.temp_group_array, self.temp_hash_1, self.temp_hash_2)
-            return placement, gol
+            placement, gol = position_permissions_numba(board, temp, current_player, x, y)
+            return PRECIESE_PERMIT if placement else 0, PRECIESE_PERMIT if gol else 0
 
         else:
-            return None, None
+            return LAZY_PERMIT, LAZY_PERMIT
+@njit()
+def make_board_move_numba(delta: DeltaBoardArray, delta_ptr: int, board: BoardData, temp: BoardTemp, encoded_move: int, color: int):
+    """
+    Применить ход на доске.
+    НЕ ПРОВЕРЯЕТ ХОД. ПРОВЕРКА ОТДЕЛЬНО
+
+    Args:
+        move: Объект хода
+        commit: Менять ли состояние доски
+        validate: Проверять ли легальность хода
+
+    Returns:
+        True если ход легален и применен, False если отклонен
+    """
+    # Обработка паса
+
+    x,y,life_cycles,is_pass,is_swap = decode_move(encoded_move)
+
+    is_pass = encoded_move == pass_code
+    if is_pass:
+        # Пас не меняет доску, просто переключаем игрока
+        delta.valid[delta_ptr] = False
+        return
+
+    if not is_swap:
+        copyto_numba(temp.temp_state_1, board.current_state)
+        temp.temp_state_1[x,y] = color
+
+        any_capture = check_captures_local(x, y, temp.temp_state_1, temp.temp_marked_for_death, temp.temp_visited, temp.temp_positions_queue)
+        if any_capture:
+            remove_captured_stones(temp.temp_state_1, temp.temp_marked_for_death, exclude_color=color)
+
+        if life_cycles == 1:
+            game_of_life_with_captures(temp.temp_state_1, temp.temp_state_2, temp.temp_visited, temp.temp_marked_for_death, temp.temp_positions_queue, color)
+        else:
+            copyto_numba(temp.temp_state_2, temp.temp_state_1)
+
+    else:
+        swap_colours(board.current_state, temp.temp_state_1)
+        copyto_numba(temp.temp_state_2, temp.temp_state_1)
 
 
 
-    def make_move(self, encoded_move : int, color:int, out: DeltaBoard) -> (bool, str):
-        """
-        Применить ход на доске.
-        НЕ ПРОВЕРЯЕТ ХОД. ПРОВЕРКА ОТДЕЛЬНО
 
-        Args:
-            move: Объект хода
-            commit: Менять ли состояние доски
-            validate: Проверять ли легальность хода
+    # Каждый шаг записывается как отдельная позиция в историю
+    push_to_history_numba(board, temp, board.current_state)
+    copyto_numba(delta.next_hash[delta_ptr, 1], temp.temp_hash_1)
 
-        Returns:
-            True если ход легален и применен, False если отклонен
-        """
-        # Обработка паса
 
-        x,y,life_cycles,is_pass,is_swap = decode_move(encoded_move)
 
-        is_pass = encoded_move == pass_code
-        if is_pass:
-            # Пас не меняет доску, просто переключаем игрока
-            out.valid = False
-            return True, "Pass"
+    push_to_history_numba(board, temp, temp.temp_state_1)
+    copyto_numba(delta.next_hash[delta_ptr, 0], temp.temp_hash_1)
 
-        if not is_swap:
-            np.copyto(self.future_state_1, self.current_state)
-            self.future_state_1[x,y] = color
+    # Обновляем текущее состояние
+    copyto_numba(board.current_state, temp.temp_state_2)
 
-            any_capture = check_captures_local(x,y, self.future_state_1, self.temp_marked_for_death, self.temp_visited, self.temp_group_array)
-            if any_capture:
-                remove_captured_stones(self.future_state_1, self.temp_marked_for_death, exclude_color=color)
+    copyto_numba(delta.next_state[delta_ptr, 0], temp.temp_state_2)
+    copyto_numba(delta.next_state[delta_ptr, 1], temp.temp_state_1)
 
-            if life_cycles == 1:
-                game_of_life_with_captures(self.future_state_1, self.future_state_2, self.temp_visited, self.temp_marked_for_death, self.temp_group_array, color)
+    delta.valid[delta_ptr] = True
+
+@njit
+def write_eq_plane_chw(dst3, ch, src2, value):
+    h = src2.shape[0]
+    w = src2.shape[1]
+    for y in range(h):
+        for x in range(w):
+            dst3[ch, y, x] = 1.0 if src2[y, x] == value else 0.0
+
+
+@njit
+def fill_plane_chw(dst3, ch, value):
+    h = dst3.shape[1]
+    w = dst3.shape[2]
+    for y in range(h):
+        for x in range(w):
+            dst3[ch, y, x] = value
+
+@njit()
+def update_network_input_numba(board: BoardData, temp: BoardTemp, current_player_color: int, komi_norm: float):
+    """
+    Пишет вход сразу в CHW:
+    temp.tensor_chw.shape == (IN_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+    """
+    half_states = STATES_TO_NN // 2
+    opponent_color = get_opponent(current_player_color)
+
+    temp.tensor.fill(0.0)
+
+    # === 1. LOOKAHEAD ===
+    game_of_life_with_captures(
+        board.current_state,
+        temp.temp_state_1,
+        temp.temp_visited,
+        temp.temp_marked_for_death,
+        temp.temp_positions_queue,
+        current_player_color
+    )
+    write_eq_plane_chw(temp.tensor, 0, temp.temp_state_1, current_player_color)
+
+    game_of_life_with_captures(
+        board.current_state,
+        temp.temp_state_1,
+        temp.temp_visited,
+        temp.temp_marked_for_death,
+        temp.temp_positions_queue,
+        opponent_color
+    )
+    write_eq_plane_chw(temp.tensor, half_states, temp.temp_state_1, opponent_color)
+
+    # === 2. CURRENT STATE ===
+    if half_states > 1:
+        write_eq_plane_chw(temp.tensor, 1, board.current_state, current_player_color)
+        write_eq_plane_chw(temp.tensor, half_states + 1, board.current_state, opponent_color)
+
+    # === 3. HISTORY ===
+    history_needed = half_states - 2
+
+    if history_needed > 0 and board.history_count[0] > 0:
+        states_to_pull = history_needed
+        if states_to_pull > board.history_count[0]:
+            states_to_pull = board.history_count[0]
+
+        for i in range(states_to_pull):
+            idx = (board.history_ptr[0] - 1 - i) % NN_HISTORY
+            state_layer = board.history_stack[idx]
+
+            write_eq_plane_chw(temp.tensor, 2 + i, state_layer, current_player_color)
+            write_eq_plane_chw(temp.tensor, half_states + 2 + i, state_layer, opponent_color)
+
+    # === 4. KOMI CHANNEL ===
+    fill_plane_chw(temp.tensor, STATES_TO_NN, komi_norm)
+
+
+def board_with_permissions_as_text(board_state: np.ndarray, mask: np.ndarray) -> str:
+    """
+    Визуализировать текущее состояние доски с эмодзи.
+    """
+
+    lines = []
+
+    for x in range(BOARD_SIZE):
+        row_str = f"{x:2d}|"
+        for y in range(BOARD_SIZE):
+            if board_state[x,y] != EMPTY:
+                row_str += symbols[board_state[x, y]] + ""
             else:
-                np.copyto(self.future_state_2, self.future_state_1)
-
-            result = "Success"
-        else:
-            swap_colours(self.current_state, self.future_state_1)
-            np.copyto(self.future_state_2, self.future_state_1)
-
-            result = "Swap"
+                stone, gol = mask[x * BOARD_SIZE + y] > 0, mask[board_size_sqr + x * BOARD_SIZE + y] > 0
 
 
+                res = EMPTY + (100 if stone and gol else 0) + (10 if stone and not gol else 0)
 
-        # Каждый шаг записывается как отдельная позиция в историю
-        self.push_to_history(self.current_state)
-        np.copyto(out.next_hash[1], self.temp_hash_1)
-
-        self.push_to_history(self.future_state_1)
-        np.copyto(out.next_hash[0], self.temp_hash_1)
-
-        # Обновляем текущее состояние
-        np.copyto(self.current_state, self.future_state_2)
-
-        np.copyto(out.next_state[0], self.future_state_2)
-        np.copyto(out.next_state[1], self.future_state_1)
-
-        out.valid = True
-
-        return True, result
+                row_str += symbols[res] + ""
 
 
-    def __repr__(self) -> str:
-        """Строковое представление доски."""
-        stones_black = np.sum(self.current_state == BLACK)
-        stones_white = np.sum(self.current_state == WHITE)
-        return f"Board(black={stones_black}, white={stones_white})"
+        lines.append(row_str)
 
-    def board_as_text(self) -> str:
-        """
-        Визуализировать текущее состояние доски с эмодзи.
-        """
-        lines = []
-
-        for x in range(BOARD_SIZE):
-            row_str = f"{x:2d}|"
-            for y in range(BOARD_SIZE):
-                row_str += symbols[self.current_state[x, y]] + ""
-            lines.append(row_str)
-
-        return "\n".join(lines)
-
-    def board_with_permissions_as_text(self, mask: np.ndarray) -> str:
-        """
-        Визуализировать текущее состояние доски с эмодзи.
-        """
-
-        lines = []
+    return "\n".join(lines)
 
 
-        for x in range(BOARD_SIZE):
-            row_str = f"{x:2d}|"
-            for y in range(BOARD_SIZE):
-                if self.current_state[x,y] != EMPTY:
-                    row_str += symbols[self.current_state[x, y]] + ""
-                else:
-                    stone, gol = mask[x * BOARD_SIZE + y] > 0, mask[board_size_sqr + x * BOARD_SIZE + y] > 0
+@njit
+def fast_territories_numba(board: BoardData, temp: BoardTemp) -> Tuple[int, int]:
 
 
-                    res = EMPTY + (100 if stone and gol else 0) + (10 if stone and not gol else 0)
+    get_territories(board.current_state, temp.temp_visited, temp.temp_state_1, temp.temp_positions_queue)
 
-                    row_str += symbols[res] + ""
+    territory_black = 0
+    territory_white = 0
 
+    for x in range(BOARD_SIZE):
+        for y in range(BOARD_SIZE):
+            if temp.temp_state_1[x,y] == BLACK:
+                territory_black +=1
+            elif temp.temp_state_1[x,y] == WHITE:
+                territory_white += 1
 
-            lines.append(row_str)
+    return territory_black, territory_white
 
-        return "\n".join(lines)
+@njit
+def clear_board_numba(board: BoardData):
+    board.current_state.fill(0)
+    board.history_stack.fill(0)
+    board.history_hashes.fill(0)
 
-    def get_score(self) -> dict:
-        """
-        Подсчет очков по китайским правилам.
+    board.history_ptr[0] = 0
+    board.history_hash_ptr[0] = 0
+    board.history_count[0] = 0
+    board.history_hash_count[0] = 0
 
-        Китайские правила: очки = камни на доске + полностью окруженная территория.
-        Территория принадлежит игроку, если все соседи этой пустой области - камни одного цвета.
-        Если у пустой области есть соседи обоих цветов - территория нейтральная (ничья).
+@njit()
+def undo_board_numba(board: BoardData):
 
-        Returns:
-            dict: {
-                'black': int - очки черных,
-                'white': int - очки белых,
-                'neutral': int - нейтральные пункты,
-                'black_stones': int - камни черных,
-                'white_stones': int - камни белых,
-                'black_territory': int - территория черных,
-                'white_territory': int - территория белых
-            }
-        """
-        # Счетчики
+    board.history_ptr[0] = circle_add(board.history_ptr[0], -2, NN_HISTORY)
+    board.history_count[0] = board.history_count[0] - 2
 
-        np.equal(self.current_state, BLACK, out=self.temp_visited)
-        black_stones = np.count_nonzero(self.temp_visited)
+    board.history_hash_ptr[0] = circle_add(board.history_hash_ptr[0], -2, MAX_HISTORY)
+    board.history_hash_count[0] = board.history_hash_count[0] - 2
 
-        np.equal(self.current_state, WHITE, out=self.temp_visited)
-        white_stones = np.count_nonzero(self.temp_visited)
+    copyto_numba(board.current_state, board.history_stack[board.history_ptr[0]])
 
+@njit
+def get_network_input_pytorch_numba(board: BoardData, temp: BoardTemp, current_player_color: int, komi: float) -> np.ndarray:
+    """
+    Получить входной тензор в формате PyTorch (C, H, W).
+    """
+    update_network_input_numba(board, temp, current_player_color, komi)
 
-        black_territory, white_territory = self.fast_territories()
+    return temp.tensor
 
-        neutral_territory = board_size_sqr - black_territory - white_territory
+def i32_scalar(v=0):
+    return np.array([v], dtype=np.int32)
 
-        return {
-            'black': black_territory,
-            'white': white_territory,
-            'neutral': neutral_territory,
-            'black_stones': black_stones,
-            'white_stones': white_stones,
-            'black_territory': black_territory - black_stones,
-            'white_territory': white_territory - white_stones
-        }
+def build_board_data():
+    return BoardData(
+            current_state=np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+        history_stack=np.zeros((NN_HISTORY, BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+        history_hashes=np.zeros((MAX_HISTORY, 4), dtype=np.uint64),
+        zobrist_table=generate_zobrist_table(),
+        history_ptr=i32_scalar(0),
+        history_hash_ptr=i32_scalar(0),
+        history_count=i32_scalar(0),
+        history_hash_count=i32_scalar(0))
 
+def build_board_temp():
+    return BoardTemp(
+            temp_state_1=np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+        temp_state_2=np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+        temp_hash_1=np.zeros(4, dtype=np.uint64),
+        temp_hash_2=np.zeros(4, dtype=np.uint64),
+        temp_positions_queue=np.empty((board_size_sqr, 2), dtype=np.int32),
+        temp_marked_for_death=np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+        temp_visited=np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+        tensor=np.zeros(( IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float32))
 
-    def fast_territories(self) -> Tuple[int, int]:
-
-
-        get_territories(self.current_state, self.temp_visited, self.future_state_1, self.temp_queue_x,
-                        self.temp_queue_y)
-
-        np.equal(self.future_state_1, BLACK, out=self.temp_visited)
-        territory_black = 0 + np.count_nonzero(self.temp_visited)
-
-        np.equal(self.future_state_1, WHITE, out=self.temp_visited)
-        territory_white = 0 + np.count_nonzero(self.temp_visited)
-
-        return territory_black, territory_white
-
-
-    def update_network_input(self, current_player_color: int, komi: float) -> None:
-        """
-        Получить входной тензор для нейросети в формате AlphaGo Zero напрямую из массивов.
-        (Zero-allocation версия)
-        """
-        half_states = STATES_TO_NN // 2
-        opponent_color = get_opponent(current_player_color)
-
-        # Очищаем весь тензор нулями in-place перед началом записи
-        self.tensor.fill(0.0)
-
-        # === 1. ЗАГЛЯДЫВАНИЕ В БУДУЩЕЕ ===
-        game_of_life_with_captures(self.current_state, self.future_state_1, self.temp_visited,
-                                   self.temp_marked_for_death, self.temp_group_array, current_player_color)
-
-        # Используем np.equal с записью прямо в temp_visited (у него тип bool), чтобы не выделять память
-        np.equal(self.future_state_1, current_player_color, out=self.temp_visited)
-        # Копируем булевы значения в float-тензор (NumPy сам скастует True->1.0, False->0.0)
-        np.copyto(self.tensor[:, :, 0], self.temp_visited)
-
-        game_of_life_with_captures(self.current_state, self.future_state_1, self.temp_visited,
-                                   self.temp_marked_for_death, self.temp_group_array, opponent_color)
-
-        np.equal(self.future_state_1, opponent_color, out=self.temp_visited)
-        np.copyto(self.tensor[:, :, half_states], self.temp_visited)
-
-        # === 2. ТЕКУЩЕЕ СОСТОЯНИЕ ===
-        if half_states > 1:
-            np.equal(self.current_state, current_player_color, out=self.temp_visited)
-            np.copyto(self.tensor[:, :, 1], self.temp_visited)
-
-            np.equal(self.current_state, opponent_color, out=self.temp_visited)
-            np.copyto(self.tensor[:, :, half_states + 1], self.temp_visited)
-
-        # === 3. ПРОШЛЫЕ СОСТОЯНИЯ (ИЗ КОЛЬЦЕВОГО БУФЕРА) ===
-        history_needed = half_states - 2
-
-        if history_needed > 0 and self.history_count > 0:
-            states_to_pull = min(history_needed, self.history_count)
-
-            # arange создает маленький массив, но это копейки. Для полной паранойи можно держать его предсозданным
-            idx_array = (self.history_ptr - 1 - np.arange(states_to_pull)) % NN_HISTORY
-            past_states = self.history_stack[idx_array]  # Это создает 3D view (если повезет) или массив
-
-            # Для 3D истории используем np.equal.
-            # Если вы не хотите выделять временный 3D булев массив,
-            # можно делать это в цикле по каждому состоянию (states_to_pull обычно маленькое, <= 7)
-            for i in range(states_to_pull):
-                state_layer = past_states[i]
-
-                # Слой текущего игрока
-                np.equal(state_layer, current_player_color, out=self.temp_visited)
-                np.copyto(self.tensor[:, :, 2 + i], self.temp_visited)
-
-                # Слой оппонента
-                np.equal(state_layer, opponent_color, out=self.temp_visited)
-                np.copyto(self.tensor[:, :, half_states + 2 + i], self.temp_visited)
-
-        # === 4. КАНАЛ ЦВЕТА/КОМИ ===
-        # .fill() работает in-place для среза
-        self.tensor[:, :, STATES_TO_NN].fill(komi)
-
-
-
-    def get_network_input_pytorch(self, current_player_color: int, komi: float) -> np.ndarray:
-        """
-        Получить входной тензор в формате PyTorch (C, H, W).
-        """
-        self.update_network_input(current_player_color, komi)
-        tensor_chw = np.transpose(self.tensor, (2, 0, 1))
-        return tensor_chw
-
+def build_delta_board_array(max_nodes):
+    return DeltaBoardArray(next_state=np.zeros((max_nodes, 2, BOARD_SIZE, BOARD_SIZE), dtype=np.int8),
+                    next_hash=np.zeros((max_nodes, 2, 4), dtype=np.uint64),
+                    valid=np.zeros(max_nodes, dtype=np.bool_))

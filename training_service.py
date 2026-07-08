@@ -5,13 +5,26 @@ import os
 import zmq
 import torch
 import re
+import json
 
 from addresses_config import DATASETS_FILEPATH, MODELS_DIR, MODEL_PROVIDER_ADDRESS, WRITER_ADDRESS, \
     DATASET_COUNT_ADDRESS
-from config import SAMPLES_PER_TRAINING, TRAINING_STEPS, BATCH_SIZE, LEARNING_RATE
+from config import SAMPLES_PER_TRAINING, TRAINING_STEPS, BATCH_SIZE, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY
 from model_manager import ModelManager
-from rl_agent import RLAgent
-from train_network import train_network_steps
+from rl_agent import RLAgent, NewRLAgent
+from train_network import train_network_steps, train_network_steps_2
+
+METRICS_PATH = "/training_meta/training_meta.jsonl"
+
+def dump_metrics(avgs: dict, step: int, path: str = METRICS_PATH):
+    record = {
+        "step":      step,
+        "timestamp": time.time(),
+        **avgs
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def get_total_samples() -> int:
@@ -82,7 +95,7 @@ def notify_provider(model_name: str, provider_address=MODEL_PROVIDER_ADDRESS, ma
 
 
 def trainer_service():
-    model_manager = ModelManager(RLAgent, save_dir=MODELS_DIR, device="cuda")
+    model_manager = ModelManager(NewRLAgent, save_dir=MODELS_DIR, device="cuda")
 
     # Получаем все файлы в папке моделей, которые подходят под шаблон agent_vX.pth
     model_files = [f for f in os.listdir(MODELS_DIR) if re.match(r'^agent_v\d+\.pth$', f)]
@@ -114,7 +127,8 @@ def trainer_service():
 
     print("Trainer запущен. Ожидание данных...")
 
-    skips = 6*5
+    skips = 12
+    delay = 5
     current_skips = 0
 
     while True:
@@ -126,11 +140,20 @@ def trainer_service():
 
             # Загружаем последнюю модель для дообучения
             model = model_manager.model_class().to(model_manager.device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+            optimizer = torch.optim.SGD(
+                model.parameters(),
+                lr=LEARNING_RATE,
+                momentum=MOMENTUM,
+                weight_decay=WEIGHT_DECAY,
+                nesterov=True,  # Nesterov momentum — стандартная практика для SGD в DL
+            )
             model_manager.load_checkpoint(current_model_name, model, optimizer)
 
             # Обучаем! (Ваш метод train_network_steps)
-            train_network_steps(model, optimizer, steps=TRAINING_STEPS, batch_size=BATCH_SIZE, device="cuda")
+            avgs = train_network_steps_2(model, optimizer, steps=TRAINING_STEPS, batch_size=BATCH_SIZE, device="cuda")
+
+            dump_metrics(avgs, version)
 
             # Сохраняем новую версию
             version += 1
@@ -149,9 +172,9 @@ def trainer_service():
             current_skips += 1
 
             if current_skips >= skips:
-                print(f"Ожидание новых данных {new_samples}/{SAMPLES_PER_TRAINING} собрано за {skips // 6} мин")
+                print(f"Ожидание новых данных {new_samples}/{SAMPLES_PER_TRAINING} собрано за {((skips * delay) / 60):.1f} мин")
                 current_skips = 0
-            time.sleep(10)
+            time.sleep(delay)
 
 
 if __name__ == "__main__":

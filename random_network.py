@@ -1,25 +1,63 @@
 import abc
+from typing import Tuple, Callable, Union
+
 import zmq
 import pickle
 import numpy as np
 
 from numpy.random import random, uniform
 
+from numba import njit
+
+from game import GameData
 from addresses_config import get_inference_service_address
-from board import Board
-from config import BOARD_SIZE, BLACK, WHITE, board_size_sqr, IN_CHANNELS, NN_BATCH_SIZE, possible_moves_total
+from board import build_board_data, build_board_temp, fast_territories_numba
+from config import BOARD_SIZE, BLACK, WHITE, board_size_sqr, IN_CHANNELS, NN_BATCH_SIZE, possible_moves_total, pass_code
+from mcts_tree import MCTS_Tree
+from rollouts import Rollout
 
 
 class NetworkBase:
 
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name = name
 
     @abc.abstractmethod
-    def predict(self, state_numpy: np.ndarray, **kwargs) -> (np.ndarray, np.float32, np.ndarray):
+    def predict(self, state_numpy: np.ndarray, **kwargs) -> Tuple[np.ndarray, np.float32, np.ndarray]:
         pass
 
-class ZMQNetworkClient(NetworkBase):
+class AsyncNetworkBase(NetworkBase):
+    def __init__(self, name: str):
+        super().__init__(name)
+
+    def send_request(self, state_numpy: np.ndarray, **kwargs) -> None:
+        pass
+
+    def result_ready(self) -> bool:
+        pass
+
+    def get_result(self, block: bool = False):
+        pass
+
+
+
+class RandomNetworkClient(AsyncNetworkBase):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.network = RandomNetwork()
+        self.input_cache = None
+
+    def send_request(self, state_numpy: np.ndarray, **kwargs) -> None:
+        self.input_cache = state_numpy
+
+    def result_ready(self) -> bool:
+        return True
+
+    def get_result(self, block: bool = False):
+        return self.network.predict(self.input_cache)
+
+
+class ZMQNetworkClient(AsyncNetworkBase):
     def __init__(self, host=get_inference_service_address(0), name="ZMQClientAgent"):
         super().__init__(name)
         self.context = zmq.Context()
@@ -87,63 +125,82 @@ class RandomNetwork(NetworkBase):
     Policy имеет небольшой случайный шум, чтобы избежать равных вероятностей
     и bias к меньшим индексам действий.
     """
-    def __init__(self, name="RandomAgent", random_seed: int = 42):
+    def __init__(self, name="HeuristicsAgent", random_seed: int = 42, mode: int = 0):
         super().__init__(name)
-        self.rollout_games = 20
-        self.rollout_turns = 20
-        self.randomise_value = True
-        self.randomise_score = True
-        self.value_modifier = 1
-        self.random_seed = random_seed
-        self.rng = np.random.default_rng(self.random_seed)
+        self.rng = np.random.default_rng(random_seed)
+        self.rollout = Rollout()
+        self.mode = mode # 0 = full rng move, 1 = rng rollout, 2 = no eyes rollout, 3 = no_terr_dec_rollout, 4 = no_eyes_no_terr_dec_rollout;
+        self.scores = np.zeros(board_size_sqr * 2 + 1 ,dtype=np.float32)
+
+    def _dirichlet_policy(self) -> np.ndarray:
+        alpha = 0.3
+        policy = self.rng.dirichlet(np.full(possible_moves_total, alpha, dtype=np.float64))
+        return policy.astype(np.float32)
+
+    def _apply_policy_mask(self, policy: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
-        self.local_board = Board()
+        policy = policy * mask
+        s = np.sum(policy)
 
-
-    def predict(self, state: np.ndarray, **kwargs):
-        """
-        Предсказание для состояния.
-
-        Args:
-            state: Тензор состояния (игнорируется)
-
-        Returns:
-            (policy, value):
-                - policy: numpy array (723,) со случайными вероятностями
-                - value: случайное значение от -1 до 1
-        """
-
-        #policy = np.ones(BOARD_SIZE * BOARD_SIZE * 2 + 1) / (BOARD_SIZE * BOARD_SIZE * 2 + 1)
-
-        action_space_size = possible_moves_total
-        dirichlet_alpha = 0.2
-        policy = self.rng.dirichlet([dirichlet_alpha] * action_space_size).astype(np.float32)
-
-
-        for i in range(BOARD_SIZE):
-            for j in range(BOARD_SIZE):
-                if state[1, i, j] > 0:
-                    self.local_board.current_state[i, j] = BLACK
-                elif state[17, i, j] > 0:
-                    self.local_board.current_state[i, j] = WHITE
-
-        my_stones, enemy_stones = self.local_board.fast_territories()
-
-        if self.randomise_score:
-            alpha_array = np.full((board_size_sqr * 2 + 1,), dirichlet_alpha, dtype=np.float32)
-            scores = self.rng.dirichlet(alpha_array).astype(np.float32)
+        if s > 0.0:
+            policy = policy / s
         else:
-            scores = np.zeros((board_size_sqr * 2 + 1,), dtype=np.float32)
-            scores[my_stones - enemy_stones + board_size_sqr] = 1.0
+            policy.fill(0.0)
+            policy[pass_code] = 1.0
 
-        if self.randomise_value:
-            value = self.rng.uniform(-1,1) * self.value_modifier
+        return policy.astype(np.float32)
+
+    def _apply_mask_to_tree(self, tree: MCTS_Tree, mask: np.ndarray,  idx: int):
+        np.copyto(tree.delta_games.next_mask[idx], mask)
+        np.copyto(tree.data.game_state.legal_mask, mask)
+
+
+
+    def predict(
+        self,
+        state_numpy: np.ndarray = None,
+        game: MCTS_Tree = None,
+        node_idx = None,
+        **kwargs
+    ) -> Tuple[np.ndarray, np.float32, np.ndarray]:
+
+        if game is None:
+            self.mode = 0
+
+        policy = self._dirichlet_policy()
+        self.scores.fill(0.0)
+
+        if self.mode == 0:
+            print("No GameData provided! Fallback to random value")
+            value = np.float32(self.rng.uniform(-1.0, 1.0))
+
+        elif self.mode == 1:
+            value = np.float32(self.rollout.rollout(game.data.game_state, False, False, self.rng))
+
+        elif self.mode == 2:
+            mask = self.rollout.build_policy_mask(game.data.game_state, True, False)
+            policy = self._apply_policy_mask(policy, mask)
+            self._apply_mask_to_tree(game, mask, node_idx)
+            value = np.float32(self.rollout.rollout(game.data.game_state, True, False, self.rng))
+
+        elif self.mode == 3:
+            mask = self.rollout.build_policy_mask(game.data.game_state, False, True)
+            policy = self._apply_policy_mask(policy, mask)
+            self._apply_mask_to_tree(game, mask, node_idx)
+            value = np.float32(self.rollout.rollout(game.data.game_state, False, True, self.rng))
+
+        elif self.mode == 4:
+            mask = self.rollout.build_policy_mask(game.data.game_state, True, True)
+            policy = self._apply_policy_mask(policy, mask)
+            self._apply_mask_to_tree(game, mask, node_idx)
+            value = np.float32(self.rollout.rollout(game.data.game_state, True, True, self.rng))
+
         else:
-            raw_value = (my_stones - enemy_stones) * 3 / board_size_sqr
-            value = max(min(raw_value, 0.9), -0.9)
+            value = np.float32(0.0)
 
-        return policy.astype(np.float32), np.float32(value), scores
+        return policy, value, self.scores
+
 
 import torch
 import torch.nn.functional as F
@@ -194,17 +251,25 @@ class PytorchAgentWrapper(NetworkBase):
         with torch.inference_mode():
             # enabled=(self.device=='cuda') защитит от падений, если на CPU
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
-                policy_logits, value_tensor, _, score_logits = self.model(self.gpu_buffer)
+                policy_self, _, outcome_logits, territory, score_logits = self.model(self.gpu_buffer)
 
-        # 3. Обработка результатов
-        # Обязательно кастуем к float32 перед softmax, иначе в fp16 возможны underflow/overflow
-        policy_probabilities = F.softmax(policy_logits.to(torch.float32), dim=1).cpu().numpy()
+                # Берём только актуальную часть батча
+        policy_self = policy_self[0].to(torch.float32)
+        outcome_logits = outcome_logits[0].to(torch.float32)
+        score_logits = score_logits[0].to(torch.float32)
 
-        value_scalar = value_tensor.item()
+        # Политики → вероятности
+        policy_self_probs = F.softmax(policy_self, dim=0).cpu().numpy()
 
-        score_numpy = score_logits.squeeze(0).cpu().numpy()
+        # Исход → скалярное value ∈ (-1, +1)
+        outcome_probs = torch.softmax(outcome_logits, dim=0)
+        weights = outcome_logits.new_tensor([1.0, 0.0, -1.0])  # win, draw, loss
+        values = (outcome_probs * weights).sum(dim=0).cpu().numpy()  # [B]
 
-        return policy_probabilities[0], np.float32(value_scalar), score_numpy
+        # Счёт → вероятности по классам
+        score_probs = F.softmax(score_logits, dim=0).cpu().numpy()  # [B, H*W*2+1]
+
+        return policy_self_probs, values, score_probs
 
 
 class BatchedPytorchAgentWrapper:
@@ -263,15 +328,22 @@ class BatchedPytorchAgentWrapper:
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(self.device == 'cuda')):
                 # ВАЖНО: Всегда подаем полный self.gpu_buffer (размер max_batch_size).
                 # Это гарантирует, что torch.compile не будет рекомпилировать граф.
-                policy_logits, value_tensor, _, score_logits = self.model(self.gpu_buffer)
+                policy_self, _, outcome_logits, territory, score_logits = self.model(self.gpu_buffer)
 
-        # 3. Обработка результатов (берем только полезную часть до actual_batch_size)
-        valid_policy_logits = policy_logits[:actual_batch_size].to(torch.float32)
-        policy_probabilities = F.softmax(valid_policy_logits, dim=1).cpu().numpy()
+        # Берём только актуальную часть батча
+        policy_self = policy_self[:actual_batch_size].to(torch.float32)
+        outcome_logits = outcome_logits[:actual_batch_size].to(torch.float32)
+        score_logits = score_logits[:actual_batch_size].to(torch.float32)
 
-        # value_tensor обычно имеет размер (B, 1), flatten() сделает (B,)
-        values = value_tensor[:actual_batch_size].cpu().numpy().flatten()
+        # Политики → вероятности
+        policy_self_probs = F.softmax(policy_self, dim=1).cpu().numpy()
 
-        scores = score_logits[:actual_batch_size].cpu().numpy()
+        # Исход → скалярное value ∈ (-1, +1)
+        outcome_probs = torch.softmax(outcome_logits, dim=1)
+        weights = outcome_logits.new_tensor([1.0, 0.0, -1.0])  # win, draw, loss
+        values = (outcome_probs * weights).sum(dim=1).cpu().numpy()  # [B]
 
-        return policy_probabilities, values, scores
+        # Счёт → вероятности по классам
+        score_probs = F.softmax(score_logits, dim=1).cpu().numpy()  # [B, H*W*2+1]
+
+        return policy_self_probs, values, score_probs

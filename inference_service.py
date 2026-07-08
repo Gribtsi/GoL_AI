@@ -17,19 +17,25 @@ from config import INFERENCE_TIMEOUT_MS, DEEP_DEPTH, SHALLOW_DEPTH, DEEP_SEARCH_
     INFERENCE_SERVICES_COUNT, NN_BATCH_SIZE, OBS_SHAPE
 from model_manager import ModelManager
 from random_network import BatchedPytorchAgentWrapper
-from rl_agent import RLAgent
+from rl_agent import RLAgent, NewRLAgent
 
 
 class ModelClient:
     """Запрашивает актуальную модель у Провайдера через ZMQ REQ с защитой от зависаний."""
 
-    def __init__(self, provider_address=MODEL_PROVIDER_ADDRESS, save_dir="/tmp"):
+    def __init__(
+        self,
+        provider_address: str = MODEL_PROVIDER_ADDRESS,
+        save_dir: str = "/tmp",
+        inference_process_index: int = 0,
+    ):
         self.context = zmq.Context.instance()
         self.provider_address = provider_address
         self.save_dir = save_dir
+        self.inference_process_index = inference_process_index
         os.makedirs(self.save_dir, exist_ok=True)
-
         self.socket = self._create_socket()
+
     def _create_socket(self):
         """Создает новый сокет REQ с таймаутом на чтение."""
         socket = self.context.socket(zmq.REQ)
@@ -50,7 +56,7 @@ class ModelClient:
         Возвращает (model_name, is_new). Если is_new == True, файл уже сохранен на диск.
         """
         try:
-            self.socket.send_json({"command": "GET_LATEST_MODEL"})
+            self.socket.send_json({"command": "GET_LATEST_MODEL", "inference_index": self.inference_process_index})
         except zmq.ZMQError as e:
             print(f"Ошибка отправки запроса: {e}. Переподключение...")
             self._reset_socket()
@@ -144,8 +150,8 @@ class ZMQInferenceServer:
         process_model_dir = os.path.join(temp_dir, f"inference_models_p{self.process_id}")
         os.makedirs(process_model_dir, exist_ok=True)
 
-        self.model_client = ModelClient(save_dir=process_model_dir)
-        self.model_manager = ModelManager(RLAgent, save_dir=process_model_dir, device=self.device)
+        self.model_client = ModelClient(save_dir=process_model_dir, inference_process_index=self.process_id)
+        self.model_manager = ModelManager(NewRLAgent, save_dir=process_model_dir, device=self.device)
 
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
         os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
@@ -230,7 +236,6 @@ class ZMQInferenceServer:
                     actual_batch_size += 1
 
             recv_times.append(time.time() - t_cycle_start)
-
             t_gpu = time.time()
             policies, values, scores = self.model.predict(actual_batch_size)
             gpu_times.append(time.time() - t_gpu)
@@ -254,12 +259,11 @@ class ZMQInferenceServer:
             if statistics_per <= current:
 
                 if self.write_statistics:
-                    print(f"Avg batch: {statistics.mean(batch_sizes):.1f}/{self.max_batch_size} "
-                          f"| GPU: {statistics.mean(gpu_times) * 1000:.1f}ms "
-                          f"| Fill: {statistics.mean(batch_sizes) / self.max_batch_size:.0%} "
-                          f"| Avg time: {statistics.mean(wait_times) * 1000:.1f}ms "
+                    print(f"P{self.process_id} Avg batch: {statistics.mean(batch_sizes):.1f}/{self.max_batch_size} {statistics.mean(batch_sizes) / self.max_batch_size:.0%} "
                           f"| Avg recv time: {statistics.mean(recv_times) * 1000:.1f}ms "
-                          f"| Avg send time: {statistics.mean(send_times) * 1000:.1f}ms ")
+                          f"| GPU: {statistics.mean(gpu_times) * 1000:.1f}ms "
+                          f"| Avg send time: {statistics.mean(send_times) * 1000:.1f}ms "
+                          f"| Avg time: {statistics.mean(wait_times) * 1000:.1f}ms ")
                 current = 0
 
             if time.time() > self.last_update_time + self.check_for_updates_interval:
@@ -281,7 +285,7 @@ if __name__ == "__main__":
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
         os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
 
-        service = ZMQInferenceServer(process_id=i, write_statistics=i == 0)
+        service = ZMQInferenceServer(process_id=i, write_statistics=True)
         p = mp.Process(target=service.run)
         p.start()
         processes.append(p)

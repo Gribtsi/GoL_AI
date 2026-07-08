@@ -1,0 +1,1 @@
+docker-compose --profile selfplay up --build --scale worker=1

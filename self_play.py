@@ -1,23 +1,26 @@
 
 import time
 from datetime import datetime
-from typing import Tuple, List
+from typing import Tuple
 
 from IPython.display import clear_output
 from numpy.random import uniform
+from triton.language import dtype
 
-from game import Game
-from mcts_agent import MCTS_Agent
-from move import move_to_dict
 from config import EMPTY, DEEP_DEPTH, SHALLOW_DEPTH, UNTIL_THE_END_CHANCE, CONCEDE_AT, \
-    DEEP_SEARCH_CHANCE, BOARD_SIZE, possible_moves_total, IN_CHANNELS, MIN_TURNS, MAX_MOVES_PER_GAME, \
-    EXPECTED_MAX_LENGTH, LONG_GAME_VALUE, GAME_LENGTH_PENALTY_WEIGHT, symbols, PUNISH_LONG_GAME
+    DEEP_SEARCH_CHANCE, BOARD_SIZE, possible_moves_total, IN_CHANNELS, MIN_TURNS_BEFORE_RESIGN, MAX_MOVES_PER_GAME, \
+    EXPECTED_MAX_LENGTH, GAME_LENGTH_PENALTY_WEIGHT, PUNISH_LONG_GAME, BAD_VALUES_COUNT, MAX_KOMI, NOISE_FRAC, C_PUCT, \
+    Q_INIT_LOSS, symbols
 import numpy as np
-import json
 import h5py
 import uuid
 
-from random_komi import generate_komi
+from game import get_current_player_numba, get_winner_and_margin_numba, get_network_input_from_game, get_board_text, \
+    apply_delta_game_numba, get_score_from_game
+from mcts_tree import reset_tree_numba, begin_search_numba, add_dirichlet_noise_numba, select_leaf_numba, \
+    backpropagate_numba, expand_node_from_network_result_numba, select_action_numba, MCTS_Tree
+from random_network import NetworkBase
+
 
 def generate_name():
     big_number = 4000000000
@@ -43,9 +46,10 @@ def training_data_from_game(history: list, final_board_state: np.ndarray, score:
     ]
 
     num_turns = len(filtered_items)
+    all_turns = len(history)
 
     # Заранее выделяем память под скалярные массивы
-    values = np.zeros(num_turns, dtype=np.float32)
+    values = np.zeros(num_turns, dtype=np.int32)
     scores = np.zeros(num_turns, dtype=np.float32)
     turns = np.array([i for i, _ in filtered_items], dtype=np.int32)
     filtered_history = [turn for _, turn in filtered_items]
@@ -54,6 +58,7 @@ def training_data_from_game(history: list, final_board_state: np.ndarray, score:
     # np.array() в конце соберет их в (N, C, H, W) или подобный формат)
     state_tensors = []
     mcts_policies = []
+    mcts_opp_policies = []
     territories_list = []
 
     # Метаданные (например, ходы). HDF5 не любит вложенные словари Python.
@@ -64,10 +69,7 @@ def training_data_from_game(history: list, final_board_state: np.ndarray, score:
 
     margin = int(score.get('margin_no_komi', 0))
 
-    pure_value = 1
-    penalty = max(0.0, (game_length - EXPECTED_MAX_LENGTH) / (MAX_MOVES_PER_GAME - EXPECTED_MAX_LENGTH)) * GAME_LENGTH_PENALTY_WEIGHT
-
-    adjusted_value = pure_value - penalty if PUNISH_LONG_GAME else pure_value
+    uniform_policy = np.full(possible_moves_total, 1.0 / possible_moves_total, dtype=np.float32)
 
     for i, turn_data in enumerate(filtered_history):
 
@@ -75,23 +77,29 @@ def training_data_from_game(history: list, final_board_state: np.ndarray, score:
 
         # 1. Расчет Value и Score
         if current_player == winner:
-            values[i] = adjusted_value
+            values[i] = 0
             scores[i] = margin
         elif winner == EMPTY:
-            values[i] = 0.0
+            values[i] = 1
             scores[i] = 0
         else:
-            values[i] = -pure_value
+            values[i] = 2
             scores[i] = -margin
 
         # 2. Быстрый расчет территорий (векторизация NumPy вместо двойного цикла)
         territories = np.zeros_like(final_board_state, dtype=np.float32)
         territories[final_board_state == current_player] = 1.0
-        territories[(final_board_state != current_player) & (final_board_state != EMPTY)] = -1.0
+        territories[(final_board_state == EMPTY)] = 0.5
 
         # 3. Сбор многомерных тензоров
         state_tensors.append(turn_data['state_tensor'])
         mcts_policies.append(turn_data['mcts_policy'])
+
+        if turns[i] >= all_turns - 1:
+            mcts_opp_policies.append(uniform_policy)
+        else:
+            mcts_opp_policies.append(history[turns[i] + 1]['mcts_policy'])
+
         territories_list.append(territories)
 
         # 4. Обработка метаданных (конвертация словаря в строку для HDF5)
@@ -101,6 +109,7 @@ def training_data_from_game(history: list, final_board_state: np.ndarray, score:
     return {
         'state_tensor': np.array(state_tensors, dtype=np.float32),
         'mcts_policy': np.array(mcts_policies, dtype=np.float32),
+        'mcts_opp_policy':np.array(mcts_opp_policies, dtype=np.float32),
         'value': values,
         'score': scores,
         'territories': np.array(territories_list, dtype=np.float32),
@@ -116,7 +125,6 @@ def game_log_from_game(history: list, result: dict, agent_name: str) -> dict:
     game_length = len(history)
 
     turns = np.arange(game_length, dtype=np.int32)
-    players = np.array([turn['player'] for turn in history], dtype=np.int8)
     deep_search = np.array([bool(turn.get('deep_search', False)) for turn in history], dtype=np.bool_)
     moves = np.array([i['move'] for i in history], dtype=np.int32)
 
@@ -125,7 +133,6 @@ def game_log_from_game(history: list, result: dict, agent_name: str) -> dict:
         'game_length': np.int32(game_length),
 
         'turn': turns,
-        'player': players,
         'deep_search': deep_search,
         'move': moves,
 
@@ -133,231 +140,141 @@ def game_log_from_game(history: list, result: dict, agent_name: str) -> dict:
         'margin': np.float32(result.get('margin', 0)),
         'margin_no_komi': np.float32(result.get('margin_no_komi', 0)),
 
-        'black_total': np.float32(result.get('black', 0)),
-        'white_total': np.float32(result.get('white', 0)),
-        'neutral': np.int32(result.get('neutral', 0)),
-
         'black_stones': np.int32(result.get('black_stones', 0)),
         'white_stones': np.int32(result.get('white_stones', 0)),
         'black_territory': np.int32(result.get('black_territory', 0)),
         'white_territory': np.int32(result.get('white_territory', 0)),
 
-        'black_base': np.float32(result.get('black_base', 0)),
-        'white_base': np.float32(result.get('white_base', 0)),
         'black_komi': np.float32(result.get('black_komi', 0)),
         'white_komi': np.float32(result.get('white_komi', 0)),
-        'max_komi': np.float32(result.get('max_komi', 0)),
     }
 
 
-BAD_VALUES_COUNT = 3
-
-def all_less_than_threshold(threshold : float, values: List[float], current_ptr : int):
-    values_sum = 0
-    index = current_ptr
-    for i in range(BAD_VALUES_COUNT):
-        values_sum += values[index]
-        index = (index + 2) % (BAD_VALUES_COUNT * 2)
-    values_sum /= BAD_VALUES_COUNT
-
-    return values_sum < threshold
-
-def self_play(agent: MCTS_Agent, visualise : bool = True, extra_text : str = None, delay: float = 0, komi_offset: float = 0, deep_search_chance = DEEP_SEARCH_CHANCE) -> Tuple[list, Game]:
-
-    game : Game = agent.game_state
-
-    rng = np.random.default_rng(agent.get_random_seed())
-    komi, flat_komi = generate_komi(komi_offset, rng)
-
-    game.set_komi(komi)
-
-    rng = np.random.default_rng(agent.get_random_seed())
-    till_the_end = flat_komi or (rng.uniform(0,1) <= UNTIL_THE_END_CHANCE)
-
-    best_node = None
-    history = []
-
-    values_cache = [0] * BAD_VALUES_COUNT * 2
-    values_cache_ptr = 0
-
-    if visualise:
-        print("=" * 60)
-        print("НАЧАЛО ИГРЫ")
-        print("=" * 60)
-
-    if till_the_end:
-        till_the_end_str = ' | до конца'
-    else:
-        till_the_end_str = ''
-
-    while (game is not None) and (not game.game_over):
-
-        started = time.time()
-
-        if visualise:
-            clear_output(wait=True)
-            print("=" * 60)
-            if extra_text is not None:
-                print(extra_text)
-            print(f"ХОД {game.current_move + 1}{till_the_end_str} {[f'{values_cache[i]:.2f}' for i in range(values_cache_ptr-1, values_cache_ptr - 1 - BAD_VALUES_COUNT * 2, -1)]}")
-            print(game.get_header_text())
-            print("=" * 60)
-            print(game.get_board_text())
-
-
-        is_deep = (uniform(0, 1) <= deep_search_chance)
-
-        depth = DEEP_DEPTH if is_deep else SHALLOW_DEPTH
-
-        if best_node is None:
-            encoded_move, policy, best_node = agent.search(num_simulations=depth)
-        else:
-            encoded_move, policy, best_node = agent.search(root=best_node, num_simulations=depth)
-
-        current_state_tensor = game.get_network_input_pytorch()
-
-        history.append({
-            'state_tensor': current_state_tensor.copy(),
-            'mcts_policy': policy,
-            'player': game.current_player,
-            'move': encoded_move,
-            'deep_search': is_deep
-        })
-
-        values_cache[values_cache_ptr] = agent.root.raw_value
-
-        if (not till_the_end) and (game.current_move > MIN_TURNS):
-            if all_less_than_threshold(CONCEDE_AT, values_cache, values_cache_ptr) and game.current_player != game.get_winner():
-                game.game_over = True
-
-        values_cache_ptr = (values_cache_ptr + 1) % (BAD_VALUES_COUNT * 2)
-        game.apply_delta(best_node.delta_game)
-
-        elapsed = time.time() - started
-        if elapsed < delay:
-            time.sleep(delay - elapsed)
-
-    if visualise:
-        clear_output(wait=True)
-        print("=" * 60)
-        if extra_text is not None:
-            print(extra_text)
-        print(f"Игра окончена за {game.current_move} ходов!")
-        print(game.get_winner_text())
-        print("=" * 60)
-
-        print(game.get_board_text())
-
-        print()
-
-        # Подсчет очков
-        game.print_score()
-
-    return history, game
-
-def save_game_to_hdf5(h5_file_path: str, game_data: dict, game_id: str = None):
+def self_play(
+    network: NetworkBase,
+    visualise: bool = True,
+    delay_between_turns: float = 0,
+    temperature: float = 1.0,
+    mcts_iterations: int = 400,
+        komi: float = 7.5
+) -> dict:
     """
-    Сохраняет обработанную партию в HDF5 базу данных.
+    Проводит одну игру self-play с заданными параметрами.
+
+    Args:
+        network:           Экземпляр NetworkBase (sync) или AsyncNetworkBase.
+        visualise:         Выводить доску после каждого хода.
+        delay_between_turns: Пауза (секунды) между ходами для визуализации.
+        temperature:       Температура при выборе хода (постоянная на всю игру).
+        mcts_iterations:   Количество симуляций MCTS на каждый ход.
+
+    Returns:
+        (states, policies, result_meta) — тренировочные данные партии.
     """
-    if game_id is None:
-        game_id = generate_name()
+    rng = np.random.default_rng()
 
-    with h5py.File(h5_file_path, 'a', libver=('v110','latest')) as f:
-        if 'state_tensor' not in f:
-            # Задаем maxshape=(None, ...) чтобы они могли расти бесконечно.
-            # chunks обязательно нужно настроить (здесь для примера беру (128, ...))
-            f.create_dataset('state_tensor', shape=(0, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), maxshape=(None, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE), chunks=(4, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE),
-                             dtype='float32', compression='lzf')
-            f.create_dataset('mcts_policy', shape=(0, possible_moves_total), maxshape=(None, possible_moves_total), chunks=(32, possible_moves_total), dtype='float32',
-                             compression='lzf')
-            f.create_dataset('territories', shape=(0, BOARD_SIZE, BOARD_SIZE), maxshape=(None, BOARD_SIZE, BOARD_SIZE), chunks=(64, BOARD_SIZE, BOARD_SIZE),
-                             dtype='int8', compression='lzf')
-            f.create_dataset('value', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='float32')
-            f.create_dataset('score', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int64')
-            f.create_dataset('turn', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int32')
-            f.create_dataset('move_meta', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='S32')
-            f.create_dataset('game_id', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='S32')
-            f.create_dataset('noise_seed', shape=(0,), maxshape=(None,), chunks=(1024,), dtype='int32')
+    # ── инициализация дерева ──────────────────────────────────────────────
+    tree = MCTS_Tree(max_nodes=mcts_iterations + 10, komi_norm=komi / MAX_KOMI)
+    reset_tree_numba(tree.data)
+    begin_search_numba(tree.data, tree.delta_games, root_idx=-1)
 
-        d_state = f['state_tensor']
-        d_policy = f['mcts_policy']
-        d_terr = f['territories']
-        d_value = f['value']
-        d_score = f['score']
-        d_turn = f['turn']
-        d_meta = f['move_meta']
-        d_gameid = f['game_id']
-        d_noise_seed = f['noise_seed']
+    history: list[dict] = []
+    
+    # ── главный цикл игры ─────────────────────────────────────────────────
+    while not tree.data.game_state.game_over[0]:
+        root_player = get_current_player_numba(tree.data.game_state)
+        sims_done = tree.data.visit_count[tree.data.root_index[0]]
 
-        total_samples = d_state.shape[0]
+        # ── цикл симуляций MCTS ───────────────────────────────────────────
+        while sims_done < mcts_iterations:
+            root_idx = tree.data.root_index[0]
 
-        added_samples = len(game_data['turn'])
+            if tree.data.is_expanded[root_idx]:
+                add_dirichlet_noise_numba(
+                    tree.data, tree.temp, tree.delta_games,
+                    root_idx, NOISE_FRAC, rng
+                )
 
-        if added_samples == 0:
-            return
+            leaf_idx = select_leaf_numba(
+                tree.data, tree.temp,
+                tree.delta_games, tree.delta_boards,
+                C_PUCT, Q_INIT_LOSS
+            )
 
-        new_total = total_samples + added_samples
+            if tree.data.game_state.game_over[0]:
+                # терминальный узел — оцениваем напрямую
+                winner, _ = get_winner_and_margin_numba(tree.data.game_state)
+                value = 1.0 if winner == root_player else (
+                    0.0 if winner == EMPTY else -1.0
+                )
+                tree.data.is_terminal[leaf_idx] = True
+                backpropagate_numba(tree.data, tree.temp, tree.delta_games, value)
+                sims_done += 1
+                continue
 
-        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_gameid, d_noise_seed]:
-            dset.resize((new_total,) + dset.shape[1:])
-
-        noise_seed = game_data['noise_seed_meta']
-
-        d_state[total_samples:new_total] = game_data['state_tensor']
-        d_policy[total_samples:new_total] = game_data['mcts_policy']
-        d_terr[total_samples:new_total] = game_data['territories']
-        d_value[total_samples:new_total] = game_data['value']
-        d_score[total_samples:new_total] = game_data['score']
-        d_turn[total_samples:new_total] = game_data['turn']
-        d_meta[total_samples:new_total] = np.array(game_data['move_meta']).astype('S64')
-        d_noise_seed[total_samples:new_total] = np.array([noise_seed] * added_samples).astype('int32')
-
-        d_gameid[total_samples:new_total] = np.array([game_id] * added_samples).astype('S32')
-
-        for dset in [d_state, d_policy, d_terr, d_value, d_score, d_turn, d_meta, d_noise_seed, d_gameid]:
-            dset.flush()
+            # ── запрос к нейросети ──────────────────────── ────────────────
+            state_tensor = get_network_input_from_game(tree.data.game_state)
 
 
+            policy, value, score = network.predict(state_numpy=state_tensor, game=tree, node_idx=leaf_idx)
 
-def generate_self_play_games(
-        games_to_generate: int,
-        rl_agent: MCTS_Agent,
-        file_path: str,
-        log: bool,
-        write: bool):
+            utility = expand_node_from_network_result_numba(
+                tree.data, tree.temp, tree.delta_games,
+                leaf_idx, root_player, 1.0,
+                policy, value, score
+            )
+            backpropagate_numba(tree.data, tree.temp, tree.delta_games, utility)
+            sims_done += 1
 
-
-
-    start_time = time.time()
-
-    rng =  np.random.default_rng()
-
-    results = []
-
-    for index in range(games_to_generate):
-
-        text = f"ИГРА {index + 1}/{games_to_generate} | ПРОШЛО {time.time() - start_time}c."
-
-        current_seed_base = int(rng.integers(0, 2**30))
-        rl_agent.set_random_seed(current_seed_base)
-
-        history, game = self_play(agent=rl_agent, extra_text=text, visualise=log)
-
-        game_data = training_data_from_game(
-            history=history,
-            final_board_state=game.board.current_state,
-            score=game.get_score(),
-            agent_name=rl_agent.network.name,
-            noise_seed=current_seed_base
+        # ── выбор хода по результатам поиска ─────────────────────────────
+        encoded_move, best_node_idx = select_action_numba(
+            tree.data, tree.temp, temperature, rng
         )
 
-        samples = len(game_data['turn'])
-        if samples > 0 and write:
-            save_game_to_hdf5(file_path, game_data, generate_name())
+        # сохраняем тренировочную запись
+        state_for_training = get_network_input_from_game(
+            tree.data.game_state
+        ).copy()
+        mcts_policy = tree.temp.actions_value_2.copy()
+        history.append({
+            "state_tensor":      state_for_training,
+            "mcts_policy": mcts_policy,
+            "player":     root_player,
+            "move":       encoded_move,
+            'deep_search': np.random.random() > 0.5
+        })
 
-        results.append(game.get_winner())
 
-        rl_agent.flush()
+        # ── визуализация ──────────────────────────────────────────────────
+        if visualise:
+
+            turn = tree.data.game_state.current_move[0]
+            player_sym = symbols.get(root_player, "?")
+            clear_output()
+            print(f"\n── Ход {turn + 1}, игрок: {player_sym} ──")
+            print(get_board_text(tree.data.game_state))
+            print(f"   Q(root) = {tree.data.mean_value[tree.data.root_index[0]]:.3f}")
+            if delay_between_turns > 0:
+                time.sleep(delay_between_turns)
 
 
-    return  results
+        # ── применяем ход, переходим к следующему узлу ───────────────────
+        apply_delta_game_numba(
+            tree.data.game_state,
+            tree.delta_boards,
+            tree.delta_games,
+            best_node_idx
+        )
+        begin_search_numba(tree.data, tree.delta_games, root_idx=best_node_idx)
+
+    # ── итог партии ───────────────────────────────────────────────────────
+    score_meta = get_score_from_game(tree.data.game_state)
+    winner = score_meta["winner"]
+
+    if visualise:
+        w_sym = symbols.get(winner, "Ничья") if winner != EMPTY else "Ничья"
+        print(f"\n══ Партия завершена. Победитель: {w_sym} "
+              f"| Счёт: B={score_meta['black']:.1f} "
+              f"W={score_meta['white']:.1f} ══")
+
+    return training_data_from_game(history, tree.data.game_state.board.current_state, get_score_from_game(tree.data.game_state), "test", 42)

@@ -4,3 +4,4 @@ pyzmq
 msgpack-numpy
 msgpack
 numba
+scipy

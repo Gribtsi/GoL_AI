@@ -1,480 +1,352 @@
+from collections import namedtuple
 from typing import Tuple, Union
 
+from numba import njit
 import numpy as np
 
-from board import Board, get_opponent, DeltaBoard, LAZY_PERMIT, PRECIESE_PERMIT
+from board import get_opponent, LAZY_PERMIT, PRECIESE_PERMIT, BoardData, BoardTemp, undo_board_numba, \
+    DeltaBoardArray, apply_delta_board_numba, get_legal_moves_mask_lazy_numba, is_legal_board_move_numba, \
+    make_board_move_numba, get_network_input_pytorch_numba, fast_territories_numba, build_board_data, build_board_temp, \
+    i32_scalar, clear_board_numba, copyto_numba, get_territories, board_with_permissions_as_text
 from config import possible_moves_total, MAX_KOMI, EMPTY, BLACK, WHITE, symbols, MAX_MOVES_PER_GAME, DRAW_AT_MAX_TURNS, \
-    BOARD_SIZE, board_size_sqr, pass_code, swap_code, ALLOW_SWAP_AT_TURN_1
+    BOARD_SIZE, board_size_sqr, pass_code, swap_code, MAX_HISTORY
 from move import encode_move, decode_move
 
-
-class DeltaGame:
-    def __init__(self):
-        self.next_mask =  np.zeros(possible_moves_total, dtype=np.int8)
-        self.delta_board = DeltaBoard()
-
-        self.is_pass = False
-        self.is_swap = False
-
-        self.valid = False
+GameData = namedtuple("GameData", [
+    "move_history",
+    "current_move",
+    "game_over",
+    "has_mask",
+    "legal_mask",
 
 
-class Game:
-    """
-    Класс управления игрой Go + Game of Life.
+    "komi_norm",
+    "max_moves",
 
-    Отвечает за:
-    - Отслеживание текущего игрока
-    - Валидацию ходов
-    - Логирование истории ходов
-    - Определение окончания игры
-    - Получение входных тензоров для нейросети
-    - Подсчет очков с учетом коми
-    """
+    "board",
+    "board_temp"
+])
 
-    def __init__(self, komi: float = 0, max_moves : int = MAX_MOVES_PER_GAME):
-        """
-        Инициализация новой игры.
-
-        Args:
-            komi: Словарь компенсации {Board.BLACK: 0.0, Board.WHITE: 6.5}.
-                  По умолчанию белые получают 6.5 очков компенсации.
-        """
-
-        self.winner = EMPTY
-
-        self.board = Board()
+DeltaGameArray = namedtuple(
+    "DeltaGameArray", [
+        "next_mask",
+        "move"
+    ]
+)
 
 
-        self.legal_mask = np.zeros(possible_moves_total, dtype=np.int8)
-        self.has_mask = False
-
-        self.current_player = BLACK  # Черные ходят первыми
-
-        self.game_over = False
-
-        self.pass_history = np.zeros(max_moves, dtype=np.bool_)
-        self.had_swap = False
-
-        # Коми в пользу БЕЛЫХ
-        self.komi = komi
-        self.komi_norm = komi / MAX_KOMI
-
-        self.max_moves = max_moves
-        self.current_move = 0
-
-    def interrupted(self) -> bool:
-        return self.game_over and (self.current_move < self.max_moves) and (self.get_consequtive_passes() < 2)
-
-    def get_consequtive_passes(self):
-        move = self.current_move
-
-        passes = 0
-
-        while move > 0 and self.pass_history[move - 1]:
-            passes += 1
-            move -= 1
-        return passes
-
-    def undo(self):
-
-        if self.current_move <= 0:
-            raise Exception("Trying to undo empty game!")
-
-        last_pass = self.current_move > 0 and self.pass_history[self.current_move - 1]
-
-        if self.current_move - 1 == 1 and self.had_swap:
-            self.set_komi(-self.komi)
-            self.had_swap = False
-
-        if not last_pass:
-            self.board.undo()
-
-        self.current_player = get_opponent(self.current_player)
-        self.has_mask = False
-
-        self.game_over = False
-
-        self.current_move -= 1
-
-
-    def apply_delta(self, delta_game: DeltaGame):
-
-        if not delta_game.valid:
-            return
-
-        self.board.apply_delta(delta_game.delta_board)
-
-        np.copyto(self.legal_mask, delta_game.next_mask)
-        self.has_mask = True
-
-        self.current_player = get_opponent(self.current_player)
-
-        self.pass_history[self.current_move] = delta_game.is_pass
-
-        self.had_swap = self.had_swap or delta_game.is_swap
-        if delta_game.is_swap:
-            self.set_komi(-self.komi)
-
-        self.current_move += 1
-
-        if self.get_consequtive_passes() >= 2:
-            self.game_over = True
-        if self.current_move >= self.max_moves:
-            self.game_over = True
+@njit()
+def get_territories_from_game(game: GameData, out: np.ndarray):
+    get_territories(game.board.current_state, game.board_temp.temp_visited, out, game.board_temp.temp_positions_queue)
 
 
 
-    def set_komi(self, komi: float):
-        self.komi = komi
-        self.komi_norm = self.komi / MAX_KOMI
+@njit
+def get_consecutive_passes_numba(game: GameData):
 
-    def clear(self):
-        self.winner = EMPTY
+    move = game.current_move[0]
 
-        self.board.clear()
-        self.has_mask = False
+    passes = 0
 
-        self.current_player = BLACK
+    while move > 0 and game.move_history[move - 1] == pass_code:
+        passes += 1
+        move -= 1
+    return passes
 
-        self.pass_history.fill(0)
+@njit()
+def is_interrupted_numba(game: GameData):
+    return game.game_over[0] and (game.current_move[0] < game.max_moves[0]) and (get_consecutive_passes_numba(game) < 2)
 
-        self.had_swap = False
-        self.game_over = False
+@njit()
+def undo_game_numba(game: GameData):
 
-        self.current_move = 0
+    if game.current_move[0] <= 0:
+        raise Exception("Trying to undo empty game!")
 
-    def can_swap(self):
-        return True if self.current_move == 1 and ALLOW_SWAP_AT_TURN_1 else False
+    current_move = game.current_move[0]
+    last_pass = current_move > 0 and game.move_history[current_move - 1] == pass_code
+    last_swap = current_move == 2 and game.move_history[current_move - 1] == swap_code
 
-    def update_legal_moves_mask(self):
-        if not self.has_mask:
+    if last_swap:
+        game.komi_norm[0] = -game.komi_norm[0]
 
-            self.board.get_legal_moves_mask_lazy(self.legal_mask)
-            # Пас всегда легален
-            self.legal_mask[pass_code] = PRECIESE_PERMIT
-            # Свап легален на первый ход белых
-            self.legal_mask[swap_code] = PRECIESE_PERMIT if self.can_swap() else 0
+    if not last_pass:
+        undo_board_numba(game.board)
 
-            self.has_mask = True
+    game.has_mask[0] = False
 
-    def get_legal_moves_mask_lazy(self, out: np.ndarray):
-        self.update_legal_moves_mask()
+    game.game_over[0] = False
 
-        for i in range(possible_moves_total):
-            out[i] = 1.0 if self.legal_mask[i] > 0 else 0.0
+    game.current_move[0] -= 1
 
-    def get_legal_moves_mask_preciese(self, out : np.ndarray):
+@njit()
+def apply_delta_game_numba(game: GameData, delta_boards: DeltaBoardArray, deltas: DeltaGameArray, ptr: int):
 
-        self.board.get_legal_moves_mask(self.current_player, out)
 
+    apply_delta_board_numba(delta_boards, ptr, game.board)
+
+    copyto_numba(game.legal_mask, deltas.next_mask[ptr])
+    game.has_mask[0] = True
+
+    move = deltas.move[ptr]
+    game.move_history[game.current_move[0]] = move
+
+    if move == swap_code:
+        game.komi_norm[0] = -game.komi_norm[0]
+
+    game.current_move[0] = game.current_move[0] + 1
+
+    if get_consecutive_passes_numba(game) >= 2:
+        game.game_over[0] = True
+    if game.current_move[0] >= game.max_moves[0]:
+        game.game_over[0] = True
+
+
+@njit()
+def update_lazy_legal_mask(game: GameData):
+    if not game.has_mask[0]:
+        get_legal_moves_mask_lazy_numba(game.board, game.legal_mask)
         # Пас всегда легален
-        out[pass_code] = 1.0
+        game.legal_mask[pass_code] = PRECIESE_PERMIT
         # Свап легален на первый ход белых
-        out[swap_code] = 1.0 if self.can_swap() else 0.0
+        game.legal_mask[swap_code] = PRECIESE_PERMIT if (game.komi_norm == 0.0 and game.current_move[0] == 1) else 0
 
+        game.has_mask[0] = True
 
-    def is_valid_move(self, encoded_move : int, out_mask : np.ndarray) -> bool:
-        """
-        Проверить легальность хода с учетом правил игры.
+@njit()
+def is_legal_game_move_numba(game: GameData, encoded_move : int, deltas: DeltaGameArray, delta_ptr: int) -> bool:
+    """
+    Проверить легальность хода с учетом правил игры.
 
-        Args:
-            move: Объект хода
+    Args:
+        move: Объект хода
 
-        Returns:
-            True если ход легален, False иначе
-        """
+    Returns:
+        True если ход легален, False иначе
+    """
 
-        # Проверка 2: По маске пробить
+    # Проверка 2: По маске пробить
 
-        self.update_legal_moves_mask()
+    update_lazy_legal_mask(game)
 
-        if self.legal_mask[encoded_move] == 0:
-            return False
-
-        if self.legal_mask[encoded_move] == PRECIESE_PERMIT:
-            return True
-
-        x, y, gol, _, _ = decode_move(encoded_move)
-
-        idx_no_life = x * BOARD_SIZE + y
-        idx_w_life = idx_no_life + board_size_sqr
-
-        if self.legal_mask[idx_no_life] == 0:
-            return False
-
-        #Ленивое разрешение - считаем точно
-        placement_permit, gol_permit = self.board.is_move_legal(self.current_player, x,y,gol)
-
-        #Пласемент не должен быть нанкой
-        if placement_permit is None:
-            raise Exception("Legality check resulted in None in placement permission")
-
-        # Это кароче такая хитрая хуита, чтобы меньше счиатть
-        # Ходу с ГОЛ обязательно нужна легальность позиции - которая сама является ходом
-        # Так можно с одной проверки прокликать 2 позиции в маске
-        if not placement_permit:
-            self.legal_mask[idx_no_life] = 0
-            self.legal_mask[idx_w_life] = 0
-            out_mask[idx_no_life] = 0
-            out_mask[idx_w_life] = 0
-        else:
-            self.legal_mask[idx_no_life] = PRECIESE_PERMIT
-            out_mask[idx_no_life] = PRECIESE_PERMIT
-
-        if gol_permit is not None:
-            if not gol_permit:
-                self.legal_mask[idx_w_life] = 0
-                out_mask[idx_w_life] = 0
-            else:
-                self.legal_mask[idx_w_life] = PRECIESE_PERMIT
-
-            out_mask[idx_w_life] = self.legal_mask[idx_w_life]
-
-        result = gol_permit if gol == 1 else placement_permit
-
-        return result
-
-    def make_move(self, encoded_move : int, out: DeltaGame, validate = True) -> bool:
-
-        if validate and not self.is_valid_move(encoded_move, self.legal_mask):
-            out.valid = False
-            return False
-
-        self.board.make_move(encoded_move, self.current_player, out.delta_board)
-
-        is_pass = encoded_move == pass_code
-        is_swap = encoded_move == swap_code
-
-        out.is_pass = is_pass
-        out.is_swap = is_swap
-
-        if is_swap:
-            self.set_komi(-self.komi)
-            self.had_swap = True
-
-        self.pass_history[self.current_move] = is_pass
-
-        self.current_move += 1
-
-        if self.get_consequtive_passes() >= 2:
-            self.game_over = True
-
-        if self.current_move >= self.max_moves:
-            self.game_over = True
-
-        self.current_player = get_opponent(self.current_player)
-
-        self.has_mask = False
-        self.update_legal_moves_mask()
-        np.copyto(out.next_mask, self.legal_mask)
-
-        out.valid = True
-
+    if game.legal_mask[encoded_move] == 0:
+        return False
+    elif game.legal_mask[encoded_move] == PRECIESE_PERMIT:
         return True
 
-    def get_komi_for_current_player(self):
-        if self.current_player == WHITE:
-            return self.komi_norm
-        else:
-            return -self.komi_norm
+    x, y, gol, _, _ = decode_move(encoded_move)
 
-    def get_network_input_pytorch(self) -> np.ndarray:
-        """
-        Получить входной тензор для PyTorch (17×19×19).
+    idx_no_life = x * BOARD_SIZE + y
+    idx_w_life = idx_no_life + board_size_sqr
 
-        Returns:
-            Тензор в формате (C, H, W)
-        """
-        return self.board.get_network_input_pytorch(self.current_player, self.get_komi_for_current_player())
+    if game.legal_mask[idx_no_life] == 0:
+        return False
 
-    def get_score(self) -> dict:
-        """
-        Получить подсчет очков с учетом коми (китайские правила).
+    #Ленивое разрешение - считаем точно
+    placement_permit, gol_permit = is_legal_board_move_numba(game.board, game.board_temp, get_current_player_numba(game), x, y, gol)
 
-        Returns:
-            Словарь с результатами подсчета:
-            {
-                'black': float - итоговые очки черных (с коми),
-                'white': float - итоговые очки белых (с коми),
-                'black_base': int - очки черных без коми,
-                'white_base': int - очки белых без коми,
-                'black_komi': float - коми черных,
-                'white_komi': float - коми белых,
-                'winner': int - цвет победителя (BLACK или WHITE) или None при ничьей,
-                'margin': float - преимущество победителя,
-                ... (остальные поля из board.calculate_score())
-            }
-        """
-        # Получаем базовый подсчет с доски (без коми)
-        base_score = self.board.get_score()
+    # Это кароче такая хитрая хуита, чтобы меньше счиатть
+    # Ходу с ГОЛ обязательно нужна легальность позиции - которая сама является ходом
+    # Так можно с одной проверки прокликать 2 позиции в маске
+    if placement_permit != PRECIESE_PERMIT:
+        game.legal_mask[idx_no_life] = 0
+        game.legal_mask[idx_w_life] = 0
 
-        # Добавляем коми
+        deltas.next_mask[delta_ptr, idx_no_life] = 0
+        deltas.next_mask[delta_ptr, idx_w_life] = 0
+    else:
+        game.legal_mask[idx_no_life] = PRECIESE_PERMIT
 
-        komi_black = -self.komi if self.komi < 0 else 0
-        komi_white = self.komi if self.komi > 0 else 0
+        deltas.next_mask[delta_ptr, idx_no_life] = PRECIESE_PERMIT
 
-        black_total = base_score['black'] +  komi_black
-        white_total = base_score['white'] + komi_white
+    if gol_permit == 0:
+        game.legal_mask[idx_w_life] = 0
 
-        winner, margin_no_komi = self.get_winner_and_margin_fast()
-        margin = margin_no_komi + komi_black + komi_white
+        deltas.next_mask[delta_ptr, idx_w_life] = 0
+    elif gol_permit == PRECIESE_PERMIT:
+        game.legal_mask[idx_w_life] = PRECIESE_PERMIT
 
-        # Объединяем результаты
-        result = base_score.copy()
-        result.update({
-            'black_base': base_score['black'],
-            'white_base': base_score['white'],
+        deltas.next_mask[delta_ptr, idx_no_life] = PRECIESE_PERMIT
 
-            'black_komi': komi_black,
-            'white_komi': komi_white,
-            'max_komi': MAX_KOMI,
+    result = gol_permit if gol == 1 else placement_permit
 
-            'black': black_total,
-            'white': white_total,
+    return result > 0
 
-            'winner': winner,
-            'margin': margin,
-            'margin_no_komi' : margin_no_komi
-        })
+@njit()
+def get_current_player_numba(game: GameData):
+    return game.current_move[0] % 2 + 1
 
-        return result
+@njit()
+def try_make_game_move_numba(game: GameData, board_deltas: DeltaBoardArray, game_deltas: DeltaGameArray, ptr: int, encoded_move: int, validate = True) -> bool:
 
-    def get_header_text(self) -> str:
-
-        player_str = f"{symbols[self.current_player]} " + "ЧЕРНЫЕ" if self.current_player == BLACK else "БЕЛЫЕ"
-        current_player = f"Текущий игрок: {player_str}\n"
-
-        return current_player
-
-    def get_winner_text(self) -> str:
-        if self.winner == EMPTY:
-            return f"Победитель не определен"
-
-        player_str = f"{symbols[self.winner]} " + "ЧЕРНЫЕ" if self.winner == BLACK else "БЕЛЫЕ"
-        winner = f"Победитель: {player_str}\n"
-
-        return winner
-
-    def get_score_text(self) -> str:
-        """Сформировать строку с результатами подсчета очков с учетом коми."""
-        score = self.get_score()
-
-        # Обновляем состояние победителя и текст результата
-        if score['winner'] == BLACK:
-            self.winner = BLACK
-            result_text = f"⚫ ЧЕРНЫЕ ВЫИГРАЛИ с преимуществом {score['margin']:.1f} очков"
-        elif score['winner'] == WHITE:
-            self.winner = WHITE
-            result_text = f"🔴 БЕЛЫЕ ВЫИГРАЛИ с преимуществом {score['margin']:.1f} очков"
-        else:
-            result_text = "НИЧЬЯ"
-
-        # Собираем все строки в список для удобного объединения
-        lines = [
-            "=" * 60,
-            "⚫ ЧЕРНЫЕ:",
-            f"   Камни на доске: {score['black_stones']}",
-            f"   Территория:     {score['black_territory']}",
-            f"   Коми:           {score['black_komi']}",
-            f"   ИТОГО:          {score['black']}",
-            "",
-            "🔴 БЕЛЫЕ:",
-            f"   Камни на доске: {score['white_stones']}",
-            f"   Территория:     {score['white_territory']}",
-            f"   Коми:           {score['white_komi']}",
-            f"   ИТОГО:          {score['white']}",
-            "",
-            f"⚪ Нейтральные пункты: {score['neutral']}",
-            "=" * 60,
-            result_text,
-            "=" * 60
-        ]
-
-        return "\n".join(lines)
-
-    def get_board_text(self):
-        mask = np.zeros(possible_moves_total, dtype=np.float32)
-        self.get_legal_moves_mask_preciese(mask)
-
-        return self.board.board_with_permissions_as_text(mask)
-
-    def print_score(self):
-        """Вывести результаты подсчета очков с учетом коми."""
-        print(self.get_score_text())
-
-    def get_current_leader(self):
-        return self.get_winner()
-
-    def get_winner_and_margin_fast(self) -> Tuple[int,int]:
-        black, white = self.board.fast_territories()
-
-        if (DRAW_AT_MAX_TURNS and (self.current_move >= self.max_moves)) or (black == (white + self.komi)):
-            self.winner = EMPTY
-            margin = 0
-        elif black > white + self.komi:
-            self.winner = BLACK
-            margin = black - white
-        else:
-            self.winner  = WHITE
-            margin = white - black
-
-        return self.winner, margin
+    if validate and not is_legal_game_move_numba(game, encoded_move, game_deltas, ptr):
+        return False
 
 
-    def get_winner(self):
-        self.get_winner_and_margin_fast()
-        return self.winner
 
-    def clone(self) -> 'Game':
-        """
-        Создать полную копию игры (для MCTS симуляций).
+    make_board_move_numba(board_deltas, ptr, game.board, game.board_temp, encoded_move, get_current_player_numba(game))
 
-        Returns:
-            Копия объекта Game
-        """
-        new_game = Game(komi=self.komi)
+    if encoded_move == swap_code:
+        game.komi_norm[0] = -game.komi_norm[0]
 
-        new_game.board = self.board.clone()
+    game.move_history[game.current_move[0]] = encoded_move
 
-        new_game.current_player = self.current_player
+    game.current_move[0] += 1
 
-        np.copyto(new_game.pass_history, self.pass_history)
-        new_game.had_swap = self.had_swap
+    if get_consecutive_passes_numba(game) >= 2:
+        game.game_over[0] = True
 
-        new_game.current_move += self.current_move
+    if game.current_move[0] >= game.max_moves[0]:
+        game.game_over[0] = True
 
-        new_game.game_over = self.game_over
-        new_game.winner = self.winner
+    game.has_mask[0] = False
+    update_lazy_legal_mask(game)
 
-        return new_game
+    copyto_numba(game_deltas.next_mask[ptr], game.legal_mask)
+    game_deltas.move[ptr] = encoded_move
 
-    def copy(self, target:'Game'):
+    return True
 
-        self.board.copy(target.board)
+@njit()
+def get_komi_for_current_player_numba(game:GameData):
+    if get_current_player_numba(game) == WHITE:
+        return game.komi_norm[0]
+    else:
+        return -game.komi_norm[0]
 
-        target.current_player = self.current_player
+@njit()
+def get_network_input_from_game(game: GameData) -> np.ndarray:
+    """
+    Получить входной тензор для PyTorch (17×19×19).
 
-        target.current_move = self.current_move
+    Returns:
+        Тензор в формате (C, H, W)
+    """
+    return get_network_input_pytorch_numba(game.board, game.board_temp, get_current_player_numba(game), get_komi_for_current_player_numba(game))
 
-        target.game_over = self.game_over
-        target.winner = self.winner
+@njit()
+def get_winner_and_margin_numba(game: GameData) -> Tuple[int, int]:
 
-        target.has_mask = self.has_mask
-        np.copyto(target.legal_mask, self.legal_mask)
 
-        target.komi = self.komi
-        target.komi_norm = self.komi_norm
+    black, white = fast_territories_numba(game.board, game.board_temp)
 
-        np.copyto(target.pass_history, self.pass_history)
-        target.had_swap = self.had_swap
+    komi = MAX_KOMI * game.komi_norm[0]
 
-    def __repr__(self) -> str:
-        """Строковое представление игры."""
-        player_str = "BLACK" if self.current_player == BLACK else "WHITE"
-        status = "FINISHED" if self.game_over else "IN PROGRESS"
-        return f"Game(player={player_str}, status={status}, komi={self.komi})"
+    if (DRAW_AT_MAX_TURNS and (game.current_move[0] >= game.max_moves[0])) or (black == (white + komi)):
+        winner = EMPTY
+        margin = 0
+    elif black > white + komi:
+        winner = BLACK
+        margin = black - white
+    else:
+        winner = WHITE
+        margin = white - black
 
+    return winner, margin
+
+def get_score_from_game(game: GameData) -> dict:
+    """
+    Получить подсчет очков с учетом коми (китайские правила).
+
+    Returns:
+        Словарь с результатами подсчета:
+        {
+            'black': float - итоговые очки черных (с коми),
+            'white': float - итоговые очки белых (с коми),
+            'black_base': int - очки черных без коми,
+            'white_base': int - очки белых без коми,
+            'black_komi': float - коми черных,
+            'white_komi': float - коми белых,
+            'winner': int - цвет победителя (BLACK или WHITE) или None при ничьей,
+            'margin': float - преимущество победителя,
+            ... (остальные поля из board.calculate_score())
+        }
+    """
+    # Получаем базовый подсчет с доски (без коми)
+    np.equal(game.board.current_state, BLACK, out=game.board_temp.temp_visited)
+    black_stones = np.count_nonzero(game.board_temp.temp_visited)
+
+    np.equal(game.board.current_state, WHITE, out=game.board_temp.temp_visited)
+    white_stones = np.count_nonzero(game.board_temp.temp_visited)
+
+    black_territory, white_territory = fast_territories_numba(game.board, game.board_temp)
+
+    neutral_territory = board_size_sqr - black_territory - white_territory
+
+    # Добавляем коми
+
+    komi = float(MAX_KOMI) * game.komi_norm[0]
+
+    komi_black = -komi if komi < 0 else 0
+    komi_white = komi if komi > 0 else 0
+
+    black_total = black_territory +  komi_black
+    white_total = white_territory + komi_white
+
+
+    winner, margin_no_komi = get_winner_and_margin_numba(game)
+
+
+    #print(f"Winner is {winner} where b{black_territory} w{white_territory} komi{game.komi_norm[0]}")
+
+    margin = margin_no_komi + komi_black + komi_white
+
+    result = {
+        'neutral': neutral_territory,
+        'black_stones': black_stones,
+        'white_stones': white_stones,
+        'black_territory': black_territory - black_stones,
+        'white_territory': white_territory - white_stones,
+
+        'black_base': black_territory,
+        'white_base': white_territory,
+
+        'black_komi': komi_black,
+        'white_komi': komi_white,
+        'max_komi': MAX_KOMI,
+
+        'black': black_total,
+        'white': white_total,
+
+        'winner': winner,
+        'margin': margin,
+        'margin_no_komi' : margin_no_komi
+    }
+
+    return result
+
+def build_delta_game_array(max_nodes: int):
+    return DeltaGameArray(
+        next_mask=np.zeros((max_nodes, possible_moves_total), dtype=np.int8),
+        move=np.zeros(max_nodes, dtype=np.int32)
+    )
+
+def get_board_text(game: GameData) -> str:
+    return board_with_permissions_as_text(game.board.current_state, game.legal_mask)
+
+def build_game_data(komi_norm: float):
+   return GameData(
+       board=build_board_data(),
+       board_temp=build_board_temp(),
+
+       move_history = np.zeros(MAX_MOVES_PER_GAME, dtype=np.int32),
+       current_move = np.zeros(1, dtype=np.int32),
+       game_over = np.zeros(1, dtype=np.bool_),
+       has_mask=np.zeros(1, dtype=np.bool_),
+       legal_mask=np.zeros(possible_moves_total, dtype=np.int8),
+
+       komi_norm = np.array([komi_norm], dtype=np.float32),
+
+       max_moves = np.array([MAX_MOVES_PER_GAME], dtype=np.int32)
+   )
+
+@njit()
+def clear_game_numba(game: GameData):
+    clear_board_numba(game.board)
+    game.move_history.fill(0)
+    game.current_move[0] = 0
+    game.game_over[0] = False
+    game.has_mask[0] = False
 
 import json
 class NumpyEncoder(json.JSONEncoder):
