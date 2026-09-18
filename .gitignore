@@ -6,6 +6,7 @@ __pycache__/
 test*
 shared*
 triton_cache/
+training_meta*
 
 # C extensions
 *.so
